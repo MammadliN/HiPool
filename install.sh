@@ -26,10 +26,15 @@ except Exception as e:
 PYCHECK
 
 echo ">>> [install] Upgrading pip..."
-python -m pip install --upgrade pip --break-system-packages
+python -m pip install --upgrade pip
+
+BREAK_FLAG=""
+if python -m pip --help | grep -q "break-system-packages"; then
+  BREAK_FLAG="--break-system-packages"
+fi
 
 echo ">>> [install] Forcing NumPy 1.26.4 (to avoid NumPy 2.x binary issues)..."
-python -m pip install --no-cache-dir --force-reinstall "numpy==1.26.4" --break-system-packages
+python -m pip install --no-cache-dir --force-reinstall "numpy==1.26.4" ${BREAK_FLAG}
 
 echo ">>> [install] NumPy version AFTER reinstall:"
 python - << 'PYCHECK'
@@ -38,7 +43,7 @@ print("NumPy:", np.__version__)
 PYCHECK
 
 echo ">>> [install] Removing problematic binary packages (soxr, pyarrow) if present..."
-python -m pip uninstall -y soxr pyarrow --break-system-packages || true
+python -m pip uninstall -y soxr pyarrow ${BREAK_FLAG} || true
 
 echo ">>> [install] Installing core scientific/audio stack..."
 python -m pip install --no-cache-dir --upgrade-strategy only-if-needed \
@@ -51,7 +56,7 @@ python -m pip install --no-cache-dir --upgrade-strategy only-if-needed \
   "soundfile==0.12.*" \
   "audiomentations==0.36.0" \
   "numba>=0.59,<0.61" \
-  --break-system-packages
+  ${BREAK_FLAG}
 
 echo ">>> [install] Installing training utilities..."
 python -m pip install --no-cache-dir --upgrade-strategy only-if-needed \
@@ -60,13 +65,13 @@ python -m pip install --no-cache-dir --upgrade-strategy only-if-needed \
   "omegaconf==2.3.0" \
   "lightning==2.5.5" \
   "torchmetrics==1.8.2" \
-  --break-system-packages
+  ${BREAK_FLAG}
 
 echo ">>> [install] Installing torchaudio (this was missing)..."
 # Do NOT pin a specific version here; let pip match the already-installed torch
 python -m pip install --no-cache-dir --upgrade-strategy only-if-needed \
   torchaudio \
-  --break-system-packages
+  ${BREAK_FLAG}
 
 echo ">>> [install] Installing remaining WSSED dependencies from sed_torch.yaml..."
 python -m pip install --no-cache-dir --upgrade-strategy only-if-needed \
@@ -105,10 +110,10 @@ python -m pip install --no-cache-dir --upgrade-strategy only-if-needed \
   "urllib3==1.26.6" \
   "urwid==2.1.2" \
   "validators==0.18.2" \
-  --break-system-packages
+  ${BREAK_FLAG}
 
 echo ">>> [install] Cleaning up unwanted extras (if they exist)..."
-python -m pip uninstall -y torch-audiomentations numpy-minmax --break-system-packages || true
+python -m pip uninstall -y torch-audiomentations numpy-minmax ${BREAK_FLAG} || true
 
 echo ">>> [install] Final sanity check (torch / torchaudio / numpy):"
 python - << 'PYCHECK'
