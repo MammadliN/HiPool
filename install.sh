@@ -1,5 +1,8 @@
 #!/bin/bash
 set -euo pipefail
+set -x
+
+trap 'status=$?; echo ">>> [install] ERROR at line ${LINENO} (exit ${status})."; exit ${status}' ERR
 
 # Run heavy installs only once per node
 DONEFILE="/tmp/hipool_install_done_${SLURM_JOB_ID:-$$}"
