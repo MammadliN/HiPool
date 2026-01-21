@@ -594,6 +594,28 @@ if __name__ == "__main__":
 
     threshold = config.threshold
 
+    print(">>> [config] SEED=", config.SEED)
+    print(">>> [config] ANURASET_ROOT=", ANURASET_ROOT)
+    print(">>> [config] FNJV_ROOT=", FNJV_ROOT)
+    print(">>> [config] DATASET_TRAIN=", DATASET_TRAIN)
+    print(">>> [config] DATASET_VAL=", DATASET_VAL)
+    print(">>> [config] DATASET_TEST=", DATASET_TEST)
+    print(">>> [config] POOLING=", POOLING)
+    print(">>> [config] BAG_SECONDS=", BAG_SECONDS)
+    print(">>> [config] MODEL_NAME=", MODEL_NAME)
+    print(">>> [config] EPOCHS=", EPOCHS)
+    print(">>> [config] BATCH_SIZE=", BATCH_SIZE)
+    print(">>> [config] NUM_WORKERS=", NUM_WORKERS)
+    print(">>> [config] LEARNING_RATE=", LEARNING_RATE)
+    print(">>> [config] VALIDATION_SPLIT=", VALIDATION_SPLIT)
+    print(">>> [config] TEST_SPLIT=", TEST_SPLIT)
+    print(">>> [config] TARGET_SPECIES=", TARGET_SPECIES)
+    print(">>> [config] sample_rate=", sample_rate)
+    print(">>> [config] n_mels=", n_mels)
+    print(">>> [config] n_fft=", n_fft)
+    print(">>> [config] hop_length=", hop_length)
+    print(">>> [config] threshold=", threshold)
+
     for epoch in range(1, EPOCHS + 1):
         model.train()
         train_losses = []
