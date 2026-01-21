@@ -1,141 +1,80 @@
 #!/bin/bash
 set -euo pipefail
-set -x
+trap 'rc=$?; echo "[install.sh] ERROR: line=$LINENO rc=$rc cmd=$BASH_COMMAND" >&2; exit $rc' ERR
 
-trap 'status=$?; echo ">>> [install] ERROR at line ${LINENO} (exit ${status})."; exit ${status}' ERR
+# Locale'i UTF-8'e zorla (heredoc/çikti kaynakli encoding hatalarini engeller)
+export LC_ALL=C.UTF-8
+export LANG=C.UTF-8
 
-# Run heavy installs only once per node
-DONEFILE="/tmp/hipool_install_done_${SLURM_JOB_ID:-$$}"
+LOGDIR="/home/nmammadli/WSSED/HiPool/prolog_logs"
+mkdir -p "${LOGDIR}"
+LOGFILE="${LOGDIR}/install-${SLURM_JOB_ID:-nojob}.log"
+exec > >(tee -a "${LOGFILE}") 2>&1
 
-# Only rank 0 does the installation; others wait
+echo ">>> [install] Host: $(hostname)"
+echo ">>> [install] User: $(whoami)"
+echo ">>> [install] PWD : $(pwd)"
+echo ">>> [install] HOME: ${HOME}"
+echo ">>> [install] SLURM_JOB_ID=${SLURM_JOB_ID:-NA} SLURM_LOCALID=${SLURM_LOCALID:-NA}"
+echo ">>> [install] Logging to: ${LOGFILE}"
+
+DONEFILE="/tmp/sed_torch_pip_install_done_${SLURM_JOB_ID:-$$}"
 if [[ "${SLURM_LOCALID:-0}" != "0" ]]; then
-  # Wait until rank 0 finishes installation
-  while [[ ! -f "${DONEFILE}" ]]; do
-    sleep 1
-  done
+  while [[ ! -f "${DONEFILE}" ]]; do sleep 1; done
   exit 0
 fi
 
-echo ">>> [install] Python version:"
-python -c "import sys; print(sys.version)"
-
-echo ">>> [install] NumPy version BEFORE install:"
-python - << 'PYCHECK' || true
-try:
-    import numpy as np
-    print("NumPy:", np.__version__)
-except Exception as e:
-    print("NumPy not importable:", e)
-PYCHECK
+echo ">>> [install] Python:"
+which python || true
+python -V
 
 echo ">>> [install] Upgrading pip..."
-python -m pip install --upgrade pip
+python -m pip install --upgrade pip --break-system-packages || python -m pip install --upgrade pip
 
-BREAK_FLAG=""
-if python -m pip --help | grep -q "break-system-packages"; then
-  BREAK_FLAG="--break-system-packages"
-fi
+echo ">>> [install] Installing validators (standalone)..."
+python -m pip install --no-cache-dir "validators==0.18.2" --break-system-packages || \
+python -m pip install --no-cache-dir "validators==0.18.2"
 
-echo ">>> [install] Forcing NumPy 1.26.4 (to avoid NumPy 2.x binary issues)..."
-python -m pip install --no-cache-dir --force-reinstall "numpy==1.26.4" ${BREAK_FLAG}
+echo ">>> [install] Installing PyYAML (Py3.10 compatible)..."
+python -m pip install --no-cache-dir "pyyaml>=6.0" --break-system-packages || \
+python -m pip install --no-cache-dir "pyyaml>=6.0"
 
-echo ">>> [install] NumPy version AFTER reinstall:"
-python - << 'PYCHECK'
-import numpy as np
-print("NumPy:", np.__version__)
-PYCHECK
+echo ">>> [install] Ensuring numba/llvmlite (Py3.10 compatible)..."
+python -m pip install --no-cache-dir \
+  "llvmlite==0.41.1" "numba==0.58.1" \
+  --break-system-packages || true
 
-echo ">>> [install] Removing problematic binary packages (soxr, pyarrow) if present..."
-python -m pip uninstall -y soxr pyarrow ${BREAK_FLAG} || true
-
-echo ">>> [install] Installing core scientific/audio stack..."
+echo ">>> [install] Installing remaining deps (avoid old pins that force source builds)..."
 python -m pip install --no-cache-dir --upgrade-strategy only-if-needed \
-  "scipy==1.12.0" \
-  "pandas==2.2.2" \
-  "scikit-learn" \
-  "matplotlib==3.9.1" \
-  "tqdm" \
-  "librosa==0.10.1" \
-  "soundfile==0.12.*" \
-  "audiomentations==0.36.0" \
-  "numba>=0.59,<0.61" \
-  ${BREAK_FLAG}
+  appdirs audioread cffi charset-normalizer cycler dcase-util decorator future idna jedi joblib kiwisolver \
+  packaging parso pooch pudb pycparser pydot-ng pygments pyparsing python-dateutil python-magic pytz \
+  requests resampy sed-eval six soundfile threadpoolctl tqdm typing-extensions urllib3 urwid \
+  --break-system-packages || true
 
-echo ">>> [install] Installing training utilities..."
-python -m pip install --no-cache-dir --upgrade-strategy only-if-needed \
-  "einops==0.8.1" \
-  "hydra-core==1.3.2" \
-  "omegaconf==2.3.0" \
-  "lightning==2.5.5" \
-  "torchmetrics==1.8.2" \
-  ${BREAK_FLAG}
+python -m pip install --no-cache-dir "librosa>=0.10.0" --break-system-packages || true
 
-echo ">>> [install] Installing torchaudio (this was missing)..."
-# Do NOT pin a specific version here; let pip match the already-installed torch
-python -m pip install --no-cache-dir --upgrade-strategy only-if-needed \
-  torchaudio \
-  ${BREAK_FLAG}
-
-echo ">>> [install] Installing remaining WSSED dependencies from sed_torch.yaml..."
-python -m pip install --no-cache-dir --upgrade-strategy only-if-needed \
-  "appdirs==1.4.4" \
-  "audioread==2.1.9" \
-  "cffi==1.14.6" \
-  "charset-normalizer==2.0.4" \
-  "cycler==0.10.0" \
-  "dcase-util==0.2.18" \
-  "decorator==5.0.9" \
-  "future==0.18.2" \
-  "idna==3.2" \
-  "jedi==0.18.0" \
-  "joblib==1.0.1" \
-  "kiwisolver==1.3.1" \
-  "llvmlite==0.37.0" \
-  "packaging==21.0" \
-  "parso==0.8.2" \
-  "pillow==8.3.1" \
-  "pooch==1.5.1" \
-  "pudb==2021.1" \
-  "pycparser==2.20" \
-  "pydot-ng==2.0.0" \
-  "pygments==2.10.0" \
-  "pyparsing==2.4.7" \
-  "python-dateutil==2.8.2" \
-  "python-magic==0.4.24" \
-  "pytz==2021.1" \
-  "pyyaml==5.4.1" \
-  "requests==2.26.0" \
-  "resampy==0.2.2" \
-  "sed-eval==0.2.1" \
-  "six==1.16.0" \
-  "threadpoolctl==2.2.0" \
-  "typing-extensions==3.10.0.0" \
-  "urllib3==1.26.6" \
-  "urwid==2.1.2" \
-  "validators==0.18.2" \
-  ${BREAK_FLAG}
-
-echo ">>> [install] Cleaning up unwanted extras (if they exist)..."
-python -m pip uninstall -y torch-audiomentations numpy-minmax ${BREAK_FLAG} || true
-
-echo ">>> [install] Final sanity check (torch / torchaudio / numpy):"
-python - << 'PYCHECK'
+# ---------
+# Sanity check: ASCII-only, fail etse bile prolog'u fail ettirme
+# ---------
+echo ">>> [install] Final sanity check (non-fatal):"
+python - <<'PY' || true
 import importlib
 
-
-def safe_import(name):
+mods = ["validators", "yaml", "numpy", "scipy", "pandas", "librosa", "torch"]
+for m in mods:
     try:
-        m = importlib.import_module(name)
-        print(f"{name}:", getattr(m, "__version__", "no __version__ attr"))
+        x = importlib.import_module(m)
+        v = getattr(x, "__version__", "NA")
+        print(m + ": OK " + str(v))
     except Exception as e:
-        print(f"{name} import FAILED:", e)
+        print(m + ": FAILED " + repr(e))
 
-
-safe_import("numpy")
-safe_import("torch")
-safe_import("torchaudio")
-safe_import("pandas")
-PYCHECK
+try:
+    import torch
+    print("torch.cuda.is_available:", torch.cuda.is_available())
+except Exception as e:
+    print("torch cuda check failed:", repr(e))
+PY
 
 touch "${DONEFILE}"
 echo ">>> [install] Done."

@@ -658,28 +658,35 @@ if __name__ == "__main__":
             torch.save(model.state_dict(), best_micro_path)
 
         print(
-            f"Epoch {epoch}/{EPOCHS} - "
-            f"Train Loss: {train_loss:.4f}, "
-            f"Val Loss: {test_loss:.4f}, "
-            f"Train Micro F1: {train_metrics['micro_f1']:.3f}, "
-            f"Val Micro F1: {test_metrics['micro_f1']:.3f}, "
-            f"Train Macro F1: {train_metrics['macro_f1']:.3f}, "
-            f"Val Macro F1: {test_metrics['macro_f1']:.3f}"
+            "Epoch {epoch}: train loss={train_loss:.4f}, micro-P={train_micro_p:.4f}, "
+            "micro-R={train_micro_r:.4f}, micro-F1={train_micro_f1:.4f}, "
+            "macro-P={train_macro_p:.4f}, macro-R={train_macro_r:.4f}, "
+            "macro-F1={train_macro_f1:.4f}, ER={train_er:.4f}".format(
+                epoch=epoch,
+                train_loss=train_loss,
+                train_micro_p=train_metrics["micro_precision"],
+                train_micro_r=train_metrics["micro_recall"],
+                train_micro_f1=train_metrics["micro_f1"],
+                train_macro_p=train_metrics["macro_precision"],
+                train_macro_r=train_metrics["macro_recall"],
+                train_macro_f1=train_metrics["macro_f1"],
+                train_er=train_metrics["macro_er"],
+            )
         )
         print(
-            "Train/Val Precision (micro/macro): "
-            f"{train_metrics['micro_precision']:.3f}/{train_metrics['macro_precision']:.3f} | "
-            f"{test_metrics['micro_precision']:.3f}/{test_metrics['macro_precision']:.3f}"
-        )
-        print(
-            "Train/Val Recall (micro/macro): "
-            f"{train_metrics['micro_recall']:.3f}/{train_metrics['macro_recall']:.3f} | "
-            f"{test_metrics['micro_recall']:.3f}/{test_metrics['macro_recall']:.3f}"
-        )
-        print(
-            "Train/Val ER (micro/macro): "
-            f"{train_metrics['micro_er']:.3f}/{train_metrics['macro_er']:.3f} | "
-            f"{test_metrics['micro_er']:.3f}/{test_metrics['macro_er']:.3f}"
+            "           val loss={val_loss:.4f}, micro-P={val_micro_p:.4f}, "
+            "micro-R={val_micro_r:.4f}, micro-F1={val_micro_f1:.4f}, "
+            "macro-P={val_macro_p:.4f}, macro-R={val_macro_r:.4f}, "
+            "macro-F1={val_macro_f1:.4f}, ER={val_er:.4f}".format(
+                val_loss=test_loss,
+                val_micro_p=test_metrics["micro_precision"],
+                val_micro_r=test_metrics["micro_recall"],
+                val_micro_f1=test_metrics["micro_f1"],
+                val_macro_p=test_metrics["macro_precision"],
+                val_macro_r=test_metrics["macro_recall"],
+                val_macro_f1=test_metrics["macro_f1"],
+                val_er=test_metrics["macro_er"],
+            )
         )
 
     best_macro_model = build_model(MODEL_NAME, num_classes, pool_style, train_dataset.seq_len, n_mels).to(device)
