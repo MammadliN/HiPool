@@ -11,6 +11,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
+import config
 from MainClasses.Models import Baseline, CDur, TALNet
 from MainClasses.MILPooling import MILPooling
 
@@ -416,40 +417,28 @@ def build_model(model_name: str, n_classes: int, pool_style: str, seq_len: int, 
 
 
 if __name__ == "__main__":
-    set_seed(42)
+    set_seed(config.SEED)
 
-    ANURASET_ROOT = "/ds-iml/Bioacoustics/AnuraSet/raw_data"
-    FNJV_ROOT = "/ds-iml/Bioacoustics/FNJV/458"
-    # /ds-iml/Bioacoustics/FNJV/578
+    ANURASET_ROOT = config.ANURASET_ROOT
+    FNJV_ROOT = config.FNJV_ROOT
 
-    DATASET_TRAIN = "AnuraSet"
-    DATASET_VAL = "AnuraSet"
-    DATASET_TEST = "AnuraSet"
+    DATASET_TRAIN = config.DATASET_TRAIN
+    DATASET_VAL = config.DATASET_VAL
+    DATASET_TEST = config.DATASET_TEST
 
-    POOLING = "mean"
-    BAG_SECONDS = 10
+    POOLING = config.POOLING
+    BAG_SECONDS = config.BAG_SECONDS
 
-    MODEL_NAME = "CDur"
-    EPOCHS = 100
-    BATCH_SIZE = 8
-    NUM_WORKERS = 4
-    LEARNING_RATE = 1e-3
+    MODEL_NAME = config.MODEL_NAME
+    EPOCHS = config.EPOCHS
+    BATCH_SIZE = config.BATCH_SIZE
+    NUM_WORKERS = config.NUM_WORKERS
+    LEARNING_RATE = config.LEARNING_RATE
 
-    VALIDATION_SPLIT = 0.2
-    TEST_SPLIT = 0.1
+    VALIDATION_SPLIT = config.VALIDATION_SPLIT
+    TEST_SPLIT = config.TEST_SPLIT
 
-    TARGET_SPECIES = [
-        "DENMIN",
-        "LEPLAT",
-        "PHYCUV",
-        "SPHSUR",
-        "SCIPER",
-        "BOABIS",
-        "BOAFAB",
-        "LEPPOD",
-        "PHYALB",
-    ]
-    # TARGET_SPECIES = ["DENMIN", "BOARAN", "DENNAN", "LEPFUS", "SCIFUS"]
+    TARGET_SPECIES = config.TARGET_SPECIES
 
     pool_map = {
         "max": "max_pool",
@@ -465,10 +454,10 @@ if __name__ == "__main__":
     }
     pool_style = pool_map[POOLING]
 
-    sample_rate = 16000
-    n_mels = 64
-    n_fft = 1024
-    hop_length = 664
+    sample_rate = config.sample_rate
+    n_mels = config.n_mels
+    n_fft = config.n_fft
+    hop_length = config.hop_length
 
     metadata_path = os.path.join(ANURASET_ROOT, "metadata.csv")
     anuraset_metadata = pd.read_csv(metadata_path)
@@ -603,7 +592,29 @@ if __name__ == "__main__":
     best_macro_f1 = -1.0
     best_micro_f1 = -1.0
 
-    threshold = 0.5
+    threshold = config.threshold
+
+    print(">>> [config] SEED=", config.SEED)
+    print(">>> [config] ANURASET_ROOT=", ANURASET_ROOT)
+    print(">>> [config] FNJV_ROOT=", FNJV_ROOT)
+    print(">>> [config] DATASET_TRAIN=", DATASET_TRAIN)
+    print(">>> [config] DATASET_VAL=", DATASET_VAL)
+    print(">>> [config] DATASET_TEST=", DATASET_TEST)
+    print(">>> [config] POOLING=", POOLING)
+    print(">>> [config] BAG_SECONDS=", BAG_SECONDS)
+    print(">>> [config] MODEL_NAME=", MODEL_NAME)
+    print(">>> [config] EPOCHS=", EPOCHS)
+    print(">>> [config] BATCH_SIZE=", BATCH_SIZE)
+    print(">>> [config] NUM_WORKERS=", NUM_WORKERS)
+    print(">>> [config] LEARNING_RATE=", LEARNING_RATE)
+    print(">>> [config] VALIDATION_SPLIT=", VALIDATION_SPLIT)
+    print(">>> [config] TEST_SPLIT=", TEST_SPLIT)
+    print(">>> [config] TARGET_SPECIES=", TARGET_SPECIES)
+    print(">>> [config] sample_rate=", sample_rate)
+    print(">>> [config] n_mels=", n_mels)
+    print(">>> [config] n_fft=", n_fft)
+    print(">>> [config] hop_length=", hop_length)
+    print(">>> [config] threshold=", threshold)
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
