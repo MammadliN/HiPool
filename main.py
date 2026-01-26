@@ -178,6 +178,8 @@ def build_anuraset_segments(
     metadata: pd.DataFrame,
     class_columns: List[str],
     segment_seconds: int,
+    overlap_bags: bool,
+    hop_seconds: int,
     subset: str,
 ) -> List[AudioSegment]:
     subset_meta = metadata[metadata["subset"] == subset]
@@ -186,7 +188,9 @@ def build_anuraset_segments(
     for (site, fname), group in grouped:
         audio_path = os.path.join(root_path, site, f"{fname}.wav")
         duration = 60
-        for start_sec in range(0, duration, segment_seconds):
+        step = hop_seconds if overlap_bags else segment_seconds
+        start_sec = 0
+        while start_sec + segment_seconds <= duration:
             end_sec = start_sec + segment_seconds
             label_rows = group[(group["min_t"] >= start_sec) & (group["max_t"] <= end_sec)]
             if label_rows.empty:
@@ -203,6 +207,7 @@ def build_anuraset_segments(
                     segment_id=segment_id,
                 )
             )
+            start_sec += step
     return segments
 
 
@@ -210,6 +215,8 @@ def build_fnjv_segments(
     root_path: str,
     class_columns: List[str],
     segment_seconds: int,
+    overlap_bags: bool,
+    hop_seconds: int,
 ) -> Tuple[List[AudioSegment], List[str]]:
     metadata_path = os.path.join(root_path, "metadata_filtered_filled.csv")
     metadata = pd.read_csv(metadata_path)
@@ -225,10 +232,10 @@ def build_fnjv_segments(
     for fname, codes_for_file in file_to_codes.items():
         audio_path = os.path.join(root_path, fname)
         duration = librosa.get_duration(path=audio_path)
-        total_segments = max(1, int(duration // segment_seconds))
-        for seg_idx in range(total_segments):
-            start_sec = seg_idx * segment_seconds
-            end_sec = start_sec + segment_seconds
+        step = hop_seconds if overlap_bags else segment_seconds
+        start_sec = 0
+        if duration < segment_seconds:
+            end_sec = segment_seconds
             label = np.array([1.0 if col in codes_for_file else 0.0 for col in class_columns], dtype=np.float32)
             segment_id = f"{os.path.splitext(fname)[0]}_{start_sec:02d}_{end_sec:02d}"
             segments.append(
@@ -240,6 +247,21 @@ def build_fnjv_segments(
                     segment_id=segment_id,
                 )
             )
+        else:
+            while start_sec + segment_seconds <= duration:
+                end_sec = start_sec + segment_seconds
+                label = np.array([1.0 if col in codes_for_file else 0.0 for col in class_columns], dtype=np.float32)
+                segment_id = f"{os.path.splitext(fname)[0]}_{start_sec:02d}_{end_sec:02d}"
+                segments.append(
+                    AudioSegment(
+                        audio_path=audio_path,
+                        start_sec=start_sec,
+                        end_sec=end_sec,
+                        label=label,
+                        segment_id=segment_id,
+                    )
+                )
+                start_sec += step
     return segments, codes
 
 
@@ -437,6 +459,8 @@ if __name__ == "__main__":
 
     VALIDATION_SPLIT = config.VALIDATION_SPLIT
     TEST_SPLIT = config.TEST_SPLIT
+    APPLY_VALIDATION_SPLIT = config.APPLY_VALIDATION_SPLIT
+    APPLY_TEST_SPLIT = config.APPLY_TEST_SPLIT
 
     TARGET_SPECIES = config.TARGET_SPECIES
 
@@ -458,6 +482,8 @@ if __name__ == "__main__":
     n_mels = config.n_mels
     n_fft = config.n_fft
     hop_length = config.hop_length
+    OVERLAP_BAGS = config.OVERLAP_BAGS
+    HOP_SECONDS = config.HOP_SECONDS
 
     metadata_path = os.path.join(ANURASET_ROOT, "metadata.csv")
     anuraset_metadata = pd.read_csv(metadata_path)
@@ -466,7 +492,13 @@ if __name__ == "__main__":
     fnjv_segments = []
     fnjv_codes: List[str] = []
     if DATASET_TRAIN == "FNJV" or DATASET_VAL == "FNJV" or DATASET_TEST == "FNJV":
-        fnjv_segments, fnjv_codes = build_fnjv_segments(FNJV_ROOT, class_columns, BAG_SECONDS)
+        fnjv_segments, fnjv_codes = build_fnjv_segments(
+            FNJV_ROOT,
+            class_columns,
+            BAG_SECONDS,
+            OVERLAP_BAGS,
+            HOP_SECONDS,
+        )
         if TARGET_SPECIES:
             class_columns = [col for col in class_columns if col in TARGET_SPECIES]
         if DATASET_TRAIN == "FNJV":
@@ -476,54 +508,69 @@ if __name__ == "__main__":
     val_segments = []
     test_segments = []
 
+    anura_train_segments = build_anuraset_segments(
+        ANURASET_ROOT,
+        anuraset_metadata,
+        class_columns,
+        BAG_SECONDS,
+        OVERLAP_BAGS,
+        HOP_SECONDS,
+        subset="train",
+    )
+    anura_test_segments = build_anuraset_segments(
+        ANURASET_ROOT,
+        anuraset_metadata,
+        class_columns,
+        BAG_SECONDS,
+        OVERLAP_BAGS,
+        HOP_SECONDS,
+        subset="test",
+    )
+
+    if APPLY_VALIDATION_SPLIT:
+        anura_train_segments, anura_val_segments, _ = split_segments(
+            anura_train_segments,
+            VALIDATION_SPLIT,
+            0.0,
+            seed=config.SEED,
+        )
+    else:
+        anura_val_segments = anura_train_segments
+
+    if APPLY_TEST_SPLIT:
+        _, _, anura_test_segments = split_segments(
+            anura_test_segments,
+            0.0,
+            TEST_SPLIT,
+            seed=config.SEED,
+        )
+
+    if APPLY_VALIDATION_SPLIT or APPLY_TEST_SPLIT:
+        fnjv_train_segments, fnjv_val_segments, fnjv_test_segments = split_segments(
+            fnjv_segments,
+            VALIDATION_SPLIT if APPLY_VALIDATION_SPLIT else 0.0,
+            TEST_SPLIT if APPLY_TEST_SPLIT else 0.0,
+            seed=config.SEED,
+        )
+    else:
+        fnjv_train_segments = fnjv_segments
+        fnjv_val_segments = fnjv_segments
+        fnjv_test_segments = fnjv_segments
+
     if DATASET_TRAIN == "AnuraSet":
-        train_segments = build_anuraset_segments(
-            ANURASET_ROOT,
-            anuraset_metadata,
-            class_columns,
-            BAG_SECONDS,
-            subset="train",
-        )
-        if DATASET_VAL == "AnuraSet":
-            train_segments, val_segments, _ = split_segments(
-                train_segments,
-                VALIDATION_SPLIT,
-                0.0,
-                seed=42,
-            )
-        if DATASET_TEST == "AnuraSet":
-            test_segments = build_anuraset_segments(
-                ANURASET_ROOT,
-                anuraset_metadata,
-                class_columns,
-                BAG_SECONDS,
-                subset="test",
-            )
+        train_segments = anura_train_segments
+    else:
+        train_segments = fnjv_train_segments
 
-    if DATASET_TRAIN == "FNJV":
-        train_segments = fnjv_segments
-        val_segments = build_anuraset_segments(
-            ANURASET_ROOT,
-            anuraset_metadata,
-            class_columns,
-            BAG_SECONDS,
-            subset="train",
-        )
-        test_segments = build_anuraset_segments(
-            ANURASET_ROOT,
-            anuraset_metadata,
-            class_columns,
-            BAG_SECONDS,
-            subset="test",
-        )
+    if DATASET_VAL == "AnuraSet":
+        val_segments = anura_val_segments
+    else:
+        val_segments = fnjv_val_segments
 
-    if DATASET_VAL == "FNJV":
-        _, fnjv_val, _ = split_segments(fnjv_segments, VALIDATION_SPLIT, TEST_SPLIT, seed=42)
-        val_segments = fnjv_val
-
-    if DATASET_TEST == "FNJV":
-        _, _, fnjv_test = split_segments(fnjv_segments, VALIDATION_SPLIT, TEST_SPLIT, seed=42)
-        test_segments = fnjv_test
+    if DATASET_TEST == "AnuraSet":
+        test_segments = anura_test_segments
+    else:
+        test_segments = fnjv_test_segments
 
     train_dataset = AudioSegmentDataset(train_segments, sample_rate, n_mels, n_fft, hop_length, BAG_SECONDS)
     val_dataset = AudioSegmentDataset(val_segments, sample_rate, n_mels, n_fft, hop_length, BAG_SECONDS)
@@ -609,12 +656,16 @@ if __name__ == "__main__":
     print(">>> [config] LEARNING_RATE=", LEARNING_RATE)
     print(">>> [config] VALIDATION_SPLIT=", VALIDATION_SPLIT)
     print(">>> [config] TEST_SPLIT=", TEST_SPLIT)
+    print(">>> [config] APPLY_VALIDATION_SPLIT=", APPLY_VALIDATION_SPLIT)
+    print(">>> [config] APPLY_TEST_SPLIT=", APPLY_TEST_SPLIT)
     print(">>> [config] TARGET_SPECIES=", TARGET_SPECIES)
     print(">>> [config] sample_rate=", sample_rate)
     print(">>> [config] n_mels=", n_mels)
     print(">>> [config] n_fft=", n_fft)
     print(">>> [config] hop_length=", hop_length)
     print(">>> [config] threshold=", threshold)
+    print(">>> [config] OVERLAP_BAGS=", OVERLAP_BAGS)
+    print(">>> [config] HOP_SECONDS=", HOP_SECONDS)
 
     for epoch in range(1, EPOCHS + 1):
         model.train()

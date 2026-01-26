@@ -27,6 +27,8 @@ LEARNING_RATE = 1e-3
 
 VALIDATION_SPLIT = 0.2
 TEST_SPLIT = 0.1
+APPLY_VALIDATION_SPLIT = True
+APPLY_TEST_SPLIT = True
 
 TARGET_SPECIES = [
     "DENMIN",
@@ -47,3 +49,6 @@ n_fft = 1024
 hop_length = 664
 
 threshold = 0.5
+
+OVERLAP_BAGS = False
+HOP_SECONDS = 1
