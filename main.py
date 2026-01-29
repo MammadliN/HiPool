@@ -122,7 +122,7 @@ class CNNBiGRU(nn.Module):
         x = x.transpose(1, 2).flatten(2)
         x, _ = self.gru(x)
         y_frames = torch.sigmoid(self.out(x)).clamp(1e-7, 1.0)
-        y_clip = self.pool(y_frames, mask)
+        y_clip = pool_with_mask(self.pool, y_frames, mask)
         return y_clip, y_frames
 
 
@@ -159,7 +159,7 @@ class CNNTransformer(nn.Module):
         x = x.transpose(1, 2).flatten(2)
         x = self.transformer(x)
         y_frames = torch.sigmoid(self.out(x)).clamp(1e-7, 1.0)
-        y_clip = self.pool(y_frames, mask)
+        y_clip = pool_with_mask(self.pool, y_frames, mask)
         return y_clip, y_frames
 
 
@@ -173,6 +173,15 @@ def set_seed(seed: int) -> None:
 def compute_frames(duration_sec: float, sample_rate: int, n_fft: int, hop_length: int) -> int:
     frames = int(np.floor((duration_sec * sample_rate - n_fft) / hop_length) + 1)
     return max(frames, 1)
+
+
+def pool_with_mask(pool, y_frames, mask=None):
+    if mask is None:
+        return pool(y_frames)
+    try:
+        return pool(y_frames, mask)
+    except TypeError:
+        return pool(y_frames)
 
 
 def pool_requires_fixed_seq_len(pool_style: str) -> bool:

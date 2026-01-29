@@ -49,6 +49,13 @@ class ModelBase(nn.Module):
         super().__init__()
         self.pool_style = pool_style
         self.pool = MILPooling(n_classes=n_classes, seq_len=seq_len).get_pool(pool_style)
+    def pool_with_mask(self, y_frames, mask=None):
+        if mask is None:
+            return self.pool(y_frames)
+        try:
+            return self.pool(y_frames, mask)
+        except TypeError:
+            return self.pool(y_frames)
     def unsample(self, y_frames, org_seq_len):
         y_frames = torch.nn.functional.interpolate(
             y_frames.transpose(1, 2),
@@ -223,7 +230,7 @@ class TALNet(ModelBase):
         x = x.reshape(x.shape[0], x.shape[1], x.shape[2] * x.shape[3])
         x, _ = self.rnn(x)
         y_frames = torch.sigmoid(self.out(x))
-        y_clip = self.pool(y_frames, mask)
+        y_clip = self.pool_with_mask(y_frames, mask)
         if upsample:
             y_frames = self.unsample(y_frames, inputs.shape[1])
         return y_clip, y_frames
@@ -238,7 +245,7 @@ class Baseline(ModelBase):
 
     def forward(self, inputs, upsample=False, mask=None, **_kwargs):
         y_frames = self.crnn(inputs.transpose(1, 2))
-        y_clip = self.pool(y_frames, mask)
+        y_clip = self.pool_with_mask(y_frames, mask)
         if upsample:
             y_frames = self.unsample(y_frames, inputs.shape[1])
         return y_clip, y_frames
@@ -284,7 +291,7 @@ class CDur(ModelBase):
         x = x.transpose(1, 2).contiguous().flatten(-2)
         x, _ = self.gru(x)
         y_frames = torch.sigmoid(self.outputlayer(x)).clamp(1e-7, 1.)
-        y_clip = self.pool(y_frames, mask)
+        y_clip = self.pool_with_mask(y_frames, mask)
         if upsample:
             y_frames = self.unsample(y_frames, time)
         return y_clip.clamp(1e-7, 1.), y_frames.clamp(1e-7, 1.)
