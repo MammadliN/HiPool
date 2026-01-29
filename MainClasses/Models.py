@@ -218,7 +218,7 @@ class TALNet(ModelBase):
         init_gru(self.rnn)
         init_layer(self.out)
 
-    def forward(self, inputs, upsample=False, mask=None):
+    def forward(self, inputs, upsample=False, mask=None, **_kwargs):
         x = self.cnn(inputs.unsqueeze(1)).transpose(1, 2)
         x = x.reshape(x.shape[0], x.shape[1], x.shape[2] * x.shape[3])
         x, _ = self.rnn(x)
@@ -236,7 +236,7 @@ class Baseline(ModelBase):
         self.crnn = CRNN1D(n_classes)
         self.name = 'baseline_' + pool_style
 
-    def forward(self, inputs, upsample=False, mask=None):
+    def forward(self, inputs, upsample=False, mask=None, **_kwargs):
         y_frames = self.crnn(inputs.transpose(1, 2))
         y_clip = self.pool(y_frames, mask)
         if upsample:
@@ -277,7 +277,7 @@ class CDur(ModelBase):
         init_gru(self.gru)
         init_layer(self.outputlayer)
         
-    def forward(self, x, upsample=True, mask=None):
+    def forward(self, x, upsample=True, mask=None, **_kwargs):
         batch, time, dim = x.shape
         x = x.unsqueeze(1)
         x = self.cnn(x)

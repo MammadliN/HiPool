@@ -115,7 +115,7 @@ class CNNBiGRU(nn.Module):
         self.out = nn.Linear(256, n_classes)
 
     def forward(
-        self, inputs: torch.Tensor, upsample: bool = False, mask: Optional[torch.Tensor] = None
+        self, inputs: torch.Tensor, upsample: bool = False, mask: Optional[torch.Tensor] = None, **_kwargs
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         x = inputs.unsqueeze(1)
         x = self.features(x)
@@ -152,7 +152,7 @@ class CNNTransformer(nn.Module):
         self.out = nn.Linear((n_mels // 4) * 64, n_classes)
 
     def forward(
-        self, inputs: torch.Tensor, upsample: bool = False, mask: Optional[torch.Tensor] = None
+        self, inputs: torch.Tensor, upsample: bool = False, mask: Optional[torch.Tensor] = None, **_kwargs
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         x = inputs.unsqueeze(1)
         x = self.cnn(x)
@@ -445,7 +445,9 @@ def evaluate_model(
             y_data = y_data.to(device)
             if mask is not None:
                 mask = mask.to(device)
-            y_pred, _ = model(x_data, mask=mask)
+                y_pred, _ = model(x_data, mask=mask)
+            else:
+                y_pred, _ = model(x_data)
             loss = loss_fn(y_pred, y_data).mean()
             losses.append(loss.item())
             preds.append(y_pred.cpu().numpy())
@@ -834,7 +836,9 @@ if __name__ == "__main__":
             y_data = y_data.to(device)
             if mask is not None:
                 mask = mask.to(device)
-            y_pred, _ = model(x_data, mask=mask)
+                y_pred, _ = model(x_data, mask=mask)
+            else:
+                y_pred, _ = model(x_data)
             loss = loss_fn(y_pred, y_data).mean()
             optimizer.zero_grad()
             loss.backward()
