@@ -39,7 +39,9 @@ class HiPool(HiPoolFamily):
         w[:, -1] += 0.01
         self.w = nn.Parameter(w, requires_grad=True)
 
-    def forward(self, y_frame):
+    def forward(self, y_frame, mask=None):
+        if mask is not None:
+            y_frame = y_frame * mask.unsqueeze(-1)
         alphas = self.w.softmax(-1)
         if self.training:
             y_clip = torch.zeros((len(y_frame), self.n_classes, len(self.n_star)), requires_grad=True).cuda()
@@ -72,7 +74,9 @@ class HiPoolPlus(HiPoolFamily):
         y = torch.sum(yi_bin * torch.exp(yi_bin), dim=-1) / torch.sum(torch.exp(yi_bin), dim=-1)
         return y
 
-    def forward(self, y_frame):
+    def forward(self, y_frame, mask=None):
+        if mask is not None:
+            y_frame = y_frame * mask.unsqueeze(-1)
         alphas = self.w.softmax(-1)
         if self.training:
             self.tag = False
@@ -98,7 +102,9 @@ class HiPoolFixed(HiPoolFamily):
         super(HiPoolFixed, self).__init__(seq_len, n_classes)
     def set_R(self, R):
         self.R = R
-    def forward(self, y_frame):
+    def forward(self, y_frame, mask=None):
+        if mask is not None:
+            y_frame = y_frame * mask.unsqueeze(-1)
         y_clip = torch.zeros((len(y_frame), self.n_classes)).cuda()
         for k in range(self.n_classes):
             y_clip[:, k] = self.pooling(y_frame[:, :, k].unsqueeze(1), self.R).squeeze()
