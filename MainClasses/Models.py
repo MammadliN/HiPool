@@ -218,12 +218,12 @@ class TALNet(ModelBase):
         init_gru(self.rnn)
         init_layer(self.out)
 
-    def forward(self, inputs, upsample=False):
+    def forward(self, inputs, upsample=False, mask=None, **_kwargs):
         x = self.cnn(inputs.unsqueeze(1)).transpose(1, 2)
         x = x.reshape(x.shape[0], x.shape[1], x.shape[2] * x.shape[3])
         x, _ = self.rnn(x)
         y_frames = torch.sigmoid(self.out(x))
-        y_clip = self.pool(y_frames)
+        y_clip = self.pool(y_frames, mask)
         if upsample:
             y_frames = self.unsample(y_frames, inputs.shape[1])
         return y_clip, y_frames
@@ -236,9 +236,9 @@ class Baseline(ModelBase):
         self.crnn = CRNN1D(n_classes)
         self.name = 'baseline_' + pool_style
 
-    def forward(self, inputs, upsample=False):
+    def forward(self, inputs, upsample=False, mask=None, **_kwargs):
         y_frames = self.crnn(inputs.transpose(1, 2))
-        y_clip = self.pool(y_frames)
+        y_clip = self.pool(y_frames, mask)
         if upsample:
             y_frames = self.unsample(y_frames, inputs.shape[1])
         return y_clip, y_frames
@@ -277,14 +277,14 @@ class CDur(ModelBase):
         init_gru(self.gru)
         init_layer(self.outputlayer)
         
-    def forward(self, x, upsample=True):
+    def forward(self, x, upsample=True, mask=None, **_kwargs):
         batch, time, dim = x.shape
         x = x.unsqueeze(1)
         x = self.cnn(x)
         x = x.transpose(1, 2).contiguous().flatten(-2)
         x, _ = self.gru(x)
         y_frames = torch.sigmoid(self.outputlayer(x)).clamp(1e-7, 1.)
-        y_clip = self.pool(y_frames)
+        y_clip = self.pool(y_frames, mask)
         if upsample:
             y_frames = self.unsample(y_frames, time)
         return y_clip.clamp(1e-7, 1.), y_frames.clamp(1e-7, 1.)
