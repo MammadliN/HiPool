@@ -1,7 +1,7 @@
 import os
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import librosa
 import matplotlib.pyplot as plt
@@ -23,6 +23,7 @@ class AudioSegment:
     end_sec: float
     label: np.ndarray
     segment_id: str
+    duration_sec: Optional[float] = None
 
 
 class AudioSegmentDataset(Dataset):
@@ -34,6 +35,7 @@ class AudioSegmentDataset(Dataset):
         n_fft: int,
         hop_length: int,
         segment_seconds: int,
+        fixed_frames: Optional[int] = None,
     ):
         self.segments = segments
         self.sample_rate = sample_rate
@@ -41,7 +43,10 @@ class AudioSegmentDataset(Dataset):
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.segment_seconds = segment_seconds
-        self.seq_len = int(np.floor((segment_seconds * sample_rate - n_fft) / hop_length) + 1)
+        if fixed_frames is not None:
+            self.seq_len = fixed_frames
+        else:
+            self.seq_len = int(np.floor((segment_seconds * sample_rate - n_fft) / hop_length) + 1)
 
     def __len__(self) -> int:
         return len(self.segments)
@@ -69,22 +74,18 @@ class AudioSegmentDataset(Dataset):
             window="hamming",
         )
         logmelspec = librosa.power_to_db(melspec)
-        logmelspec = logmelspec.T
-        if logmelspec.shape[0] < self.seq_len:
-            pad = np.zeros((self.seq_len - logmelspec.shape[0], self.n_mels), dtype=logmelspec.dtype)
-            logmelspec = np.concatenate([logmelspec, pad], axis=0)
-        elif logmelspec.shape[0] > self.seq_len:
-            logmelspec = logmelspec[: self.seq_len]
-        return logmelspec
+        return logmelspec.T
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str, int]:
         seg = self.segments[idx]
         audio = self._load_segment(seg.audio_path, seg.start_sec, seg.end_sec)
         feats = self._extract_logmel(audio)
+        frames_len = feats.shape[0]
         return (
             torch.from_numpy(feats).float(),
             torch.from_numpy(seg.label).float(),
             seg.segment_id,
+            frames_len,
         )
 
 
@@ -113,13 +114,15 @@ class CNNBiGRU(nn.Module):
         )
         self.out = nn.Linear(256, n_classes)
 
-    def forward(self, inputs: torch.Tensor, upsample: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, inputs: torch.Tensor, upsample: bool = False, mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         x = inputs.unsqueeze(1)
         x = self.features(x)
         x = x.transpose(1, 2).flatten(2)
         x, _ = self.gru(x)
         y_frames = torch.sigmoid(self.out(x)).clamp(1e-7, 1.0)
-        y_clip = self.pool(y_frames)
+        y_clip = self.pool(y_frames, mask)
         return y_clip, y_frames
 
 
@@ -148,13 +151,15 @@ class CNNTransformer(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
         self.out = nn.Linear((n_mels // 4) * 64, n_classes)
 
-    def forward(self, inputs: torch.Tensor, upsample: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, inputs: torch.Tensor, upsample: bool = False, mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         x = inputs.unsqueeze(1)
         x = self.cnn(x)
         x = x.transpose(1, 2).flatten(2)
         x = self.transformer(x)
         y_frames = torch.sigmoid(self.out(x)).clamp(1e-7, 1.0)
-        y_clip = self.pool(y_frames)
+        y_clip = self.pool(y_frames, mask)
         return y_clip, y_frames
 
 
@@ -164,6 +169,62 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+
+def compute_frames(duration_sec: float, sample_rate: int, n_fft: int, hop_length: int) -> int:
+    frames = int(np.floor((duration_sec * sample_rate - n_fft) / hop_length) + 1)
+    return max(frames, 1)
+
+
+def pool_requires_fixed_seq_len(pool_style: str) -> bool:
+    return pool_style in {"attention_pool", "hi_pool", "hi_pool_plus", "hi_pool_fixed"}
+
+
+def collate_default(batch):
+    feats, labels, ids, _lengths = zip(*batch)
+    return torch.stack(feats), torch.stack(labels), list(ids), None
+
+
+def collate_full_bag_pad(batch, fixed_frames: int, pad_mode: str):
+    feats, labels, ids, lengths = zip(*batch)
+    padded = []
+    masks = []
+    for feat, length in zip(feats, lengths):
+        if length >= fixed_frames:
+            feat_pad = feat[:fixed_frames]
+            mask = torch.ones(fixed_frames, dtype=torch.float32)
+        else:
+            if pad_mode == "repeat":
+                reps = fixed_frames // length
+                remainder = fixed_frames % length
+                tiles = [feat] * reps
+                if remainder > 0:
+                    tiles.append(feat[:remainder])
+                feat_pad = torch.cat(tiles, dim=0)
+                mask = None
+            else:
+                pad_len = fixed_frames - length
+                pad = torch.zeros((pad_len, feat.shape[1]), dtype=feat.dtype)
+                feat_pad = torch.cat([feat, pad], dim=0)
+                mask = torch.cat([torch.ones(length), torch.zeros(pad_len)])
+        padded.append(feat_pad)
+        masks.append(mask)
+
+    x = torch.stack(padded)
+    y = torch.stack(labels)
+    if pad_mode == "silence":
+        mask = torch.stack(masks)
+    else:
+        mask = None
+    return x, y, list(ids), mask
+
+
+def get_max_duration(segments: List[AudioSegment]) -> float:
+    if not segments:
+        return 0.0
+    return max(
+        seg.duration_sec if seg.duration_sec is not None else (seg.end_sec - seg.start_sec)
+        for seg in segments
+    )
 
 def get_class_columns(metadata: pd.DataFrame, target_species: List[str]) -> List[str]:
     start_idx = metadata.columns.get_loc("subset") + 1
@@ -180,6 +241,7 @@ def build_anuraset_segments(
     segment_seconds: int,
     overlap_bags: bool,
     hop_seconds: int,
+    full_bag: bool,
     subset: str,
 ) -> List[AudioSegment]:
     subset_meta = metadata[metadata["subset"] == subset]
@@ -188,26 +250,40 @@ def build_anuraset_segments(
     for (site, fname), group in grouped:
         audio_path = os.path.join(root_path, site, f"{fname}.wav")
         duration = 60
-        step = hop_seconds if overlap_bags else segment_seconds
-        start_sec = 0
-        while start_sec + segment_seconds <= duration:
-            end_sec = start_sec + segment_seconds
-            label_rows = group[(group["min_t"] >= start_sec) & (group["max_t"] <= end_sec)]
-            if label_rows.empty:
-                label = np.zeros(len(class_columns), dtype=np.float32)
-            else:
-                label = label_rows[class_columns].max().values.astype(np.float32)
-            segment_id = f"{fname}_{start_sec:02d}_{end_sec:02d}"
+        if full_bag:
+            label = group[class_columns].max().values.astype(np.float32)
             segments.append(
                 AudioSegment(
                     audio_path=audio_path,
-                    start_sec=start_sec,
-                    end_sec=end_sec,
+                    start_sec=0,
+                    end_sec=duration,
                     label=label,
-                    segment_id=segment_id,
+                    segment_id=f"{fname}_full",
+                    duration_sec=duration,
                 )
             )
-            start_sec += step
+        else:
+            step = hop_seconds if overlap_bags else segment_seconds
+            start_sec = 0
+            while start_sec + segment_seconds <= duration:
+                end_sec = start_sec + segment_seconds
+                label_rows = group[(group["min_t"] >= start_sec) & (group["max_t"] <= end_sec)]
+                if label_rows.empty:
+                    label = np.zeros(len(class_columns), dtype=np.float32)
+                else:
+                    label = label_rows[class_columns].max().values.astype(np.float32)
+                segment_id = f"{fname}_{start_sec:02d}_{end_sec:02d}"
+                segments.append(
+                    AudioSegment(
+                        audio_path=audio_path,
+                        start_sec=start_sec,
+                        end_sec=end_sec,
+                        label=label,
+                        segment_id=segment_id,
+                        duration_sec=segment_seconds,
+                    )
+                )
+                start_sec += step
     return segments
 
 
@@ -217,6 +293,7 @@ def build_fnjv_segments(
     segment_seconds: int,
     overlap_bags: bool,
     hop_seconds: int,
+    full_bag: bool,
 ) -> Tuple[List[AudioSegment], List[str]]:
     metadata_path = os.path.join(root_path, "metadata_filtered_filled.csv")
     metadata = pd.read_csv(metadata_path)
@@ -232,25 +309,23 @@ def build_fnjv_segments(
     for fname, codes_for_file in file_to_codes.items():
         audio_path = os.path.join(root_path, fname)
         duration = librosa.get_duration(path=audio_path)
-        step = hop_seconds if overlap_bags else segment_seconds
-        start_sec = 0
-        if duration < segment_seconds:
-            end_sec = segment_seconds
-            label = np.array([1.0 if col in codes_for_file else 0.0 for col in class_columns], dtype=np.float32)
-            segment_id = f"{os.path.splitext(fname)[0]}_{start_sec:02d}_{end_sec:02d}"
+        label = np.array([1.0 if col in codes_for_file else 0.0 for col in class_columns], dtype=np.float32)
+        if full_bag:
             segments.append(
                 AudioSegment(
                     audio_path=audio_path,
-                    start_sec=start_sec,
-                    end_sec=end_sec,
+                    start_sec=0,
+                    end_sec=duration,
                     label=label,
-                    segment_id=segment_id,
+                    segment_id=f"{os.path.splitext(fname)[0]}_full",
+                    duration_sec=duration,
                 )
             )
         else:
-            while start_sec + segment_seconds <= duration:
-                end_sec = start_sec + segment_seconds
-                label = np.array([1.0 if col in codes_for_file else 0.0 for col in class_columns], dtype=np.float32)
+            step = hop_seconds if overlap_bags else segment_seconds
+            start_sec = 0
+            if duration < segment_seconds:
+                end_sec = segment_seconds
                 segment_id = f"{os.path.splitext(fname)[0]}_{start_sec:02d}_{end_sec:02d}"
                 segments.append(
                     AudioSegment(
@@ -259,9 +334,24 @@ def build_fnjv_segments(
                         end_sec=end_sec,
                         label=label,
                         segment_id=segment_id,
+                        duration_sec=segment_seconds,
                     )
                 )
-                start_sec += step
+            else:
+                while start_sec + segment_seconds <= duration:
+                    end_sec = start_sec + segment_seconds
+                    segment_id = f"{os.path.splitext(fname)[0]}_{start_sec:02d}_{end_sec:02d}"
+                    segments.append(
+                        AudioSegment(
+                            audio_path=audio_path,
+                            start_sec=start_sec,
+                            end_sec=end_sec,
+                            label=label,
+                            segment_id=segment_id,
+                            duration_sec=segment_seconds,
+                        )
+                    )
+                    start_sec += step
     return segments, codes
 
 
@@ -350,10 +440,12 @@ def evaluate_model(
     preds = []
     targets = []
     with torch.no_grad():
-        for x_data, y_data, _ in loader:
+        for x_data, y_data, _, mask in loader:
             x_data = x_data.to(device)
             y_data = y_data.to(device)
-            y_pred, _ = model(x_data)
+            if mask is not None:
+                mask = mask.to(device)
+            y_pred, _ = model(x_data, mask=mask)
             loss = loss_fn(y_pred, y_data).mean()
             losses.append(loss.item())
             preds.append(y_pred.cpu().numpy())
@@ -450,6 +542,8 @@ if __name__ == "__main__":
 
     POOLING = config.POOLING
     BAG_SECONDS = config.BAG_SECONDS
+    FULL_BAG_METHOD = config.FULL_BAG_METHOD
+    PAD_MODE = config.PAD_MODE
 
     MODEL_NAME = config.MODEL_NAME
     EPOCHS = config.EPOCHS
@@ -484,6 +578,14 @@ if __name__ == "__main__":
     hop_length = config.hop_length
     OVERLAP_BAGS = config.OVERLAP_BAGS
     HOP_SECONDS = config.HOP_SECONDS
+    full_bag = BAG_SECONDS == "full"
+
+    if full_bag and FULL_BAG_METHOD == "batch":
+        BATCH_SIZE = 1
+
+    if full_bag and FULL_BAG_METHOD == "batch" and pool_requires_fixed_seq_len(pool_style):
+        print(">>> [config] Full-bag batch mode: switching pooling to avg_pool for variable length input.")
+        pool_style = "avg_pool"
 
     metadata_path = os.path.join(ANURASET_ROOT, "metadata.csv")
     anuraset_metadata = pd.read_csv(metadata_path)
@@ -498,6 +600,7 @@ if __name__ == "__main__":
             BAG_SECONDS,
             OVERLAP_BAGS,
             HOP_SECONDS,
+            full_bag,
         )
         if TARGET_SPECIES:
             class_columns = [col for col in class_columns if col in TARGET_SPECIES]
@@ -515,6 +618,7 @@ if __name__ == "__main__":
         BAG_SECONDS,
         OVERLAP_BAGS,
         HOP_SECONDS,
+        full_bag,
         subset="train",
     )
     anura_test_segments = build_anuraset_segments(
@@ -524,6 +628,7 @@ if __name__ == "__main__":
         BAG_SECONDS,
         OVERLAP_BAGS,
         HOP_SECONDS,
+        full_bag,
         subset="test",
     )
 
@@ -572,18 +677,65 @@ if __name__ == "__main__":
     else:
         test_segments = fnjv_test_segments
 
-    train_dataset = AudioSegmentDataset(train_segments, sample_rate, n_mels, n_fft, hop_length, BAG_SECONDS)
-    val_dataset = AudioSegmentDataset(val_segments, sample_rate, n_mels, n_fft, hop_length, BAG_SECONDS)
-    test_dataset = AudioSegmentDataset(test_segments, sample_rate, n_mels, n_fft, hop_length, BAG_SECONDS)
+    if full_bag and FULL_BAG_METHOD == "pad":
+        max_duration_sec = max(
+            get_max_duration(train_segments + val_segments + test_segments),
+            0.0,
+        )
+        fixed_frames = (
+            compute_frames(max_duration_sec, sample_rate, n_fft, hop_length)
+            if max_duration_sec > 0
+            else None
+        )
+        if fixed_frames is None:
+            raise ValueError("Full-bag pad mode requires at least one segment to compute max length.")
+    else:
+        fixed_frames = None
+
+    segment_seconds = BAG_SECONDS if isinstance(BAG_SECONDS, int) else 1
+
+    train_dataset = AudioSegmentDataset(
+        train_segments,
+        sample_rate,
+        n_mels,
+        n_fft,
+        hop_length,
+        segment_seconds,
+        fixed_frames=fixed_frames,
+    )
+    val_dataset = AudioSegmentDataset(
+        val_segments,
+        sample_rate,
+        n_mels,
+        n_fft,
+        hop_length,
+        segment_seconds,
+        fixed_frames=fixed_frames,
+    )
+    test_dataset = AudioSegmentDataset(
+        test_segments,
+        sample_rate,
+        n_mels,
+        n_fft,
+        hop_length,
+        segment_seconds,
+        fixed_frames=fixed_frames,
+    )
 
     num_classes = len(class_columns)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_model(MODEL_NAME, num_classes, pool_style, train_dataset.seq_len, n_mels).to(device)
+    model_seq_len = fixed_frames if fixed_frames is not None else train_dataset.seq_len
+    model = build_model(MODEL_NAME, num_classes, pool_style, model_seq_len, n_mels).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.9)
     loss_fn = nn.BCELoss()
+
+    if full_bag and FULL_BAG_METHOD == "pad":
+        collate_fn = lambda batch: collate_full_bag_pad(batch, fixed_frames, PAD_MODE)
+    else:
+        collate_fn = collate_default
 
     train_loader = DataLoader(
         train_dataset,
@@ -591,18 +743,21 @@ if __name__ == "__main__":
         shuffle=True,
         num_workers=NUM_WORKERS,
         drop_last=True,
+        collate_fn=collate_fn,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=NUM_WORKERS,
+        collate_fn=collate_fn,
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=NUM_WORKERS,
+        collate_fn=collate_fn,
     )
 
     output_dir = os.path.join(
@@ -649,6 +804,8 @@ if __name__ == "__main__":
     print(">>> [config] DATASET_TEST=", DATASET_TEST)
     print(">>> [config] POOLING=", POOLING)
     print(">>> [config] BAG_SECONDS=", BAG_SECONDS)
+    print(">>> [config] FULL_BAG_METHOD=", FULL_BAG_METHOD)
+    print(">>> [config] PAD_MODE=", PAD_MODE)
     print(">>> [config] MODEL_NAME=", MODEL_NAME)
     print(">>> [config] EPOCHS=", EPOCHS)
     print(">>> [config] BATCH_SIZE=", BATCH_SIZE)
@@ -672,10 +829,12 @@ if __name__ == "__main__":
         train_losses = []
         train_preds = []
         train_targets = []
-        for x_data, y_data, _ in train_loader:
+        for x_data, y_data, _, mask in train_loader:
             x_data = x_data.to(device)
             y_data = y_data.to(device)
-            y_pred, _ = model(x_data)
+            if mask is not None:
+                mask = mask.to(device)
+            y_pred, _ = model(x_data, mask=mask)
             loss = loss_fn(y_pred, y_data).mean()
             optimizer.zero_grad()
             loss.backward()

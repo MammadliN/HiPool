@@ -3,41 +3,73 @@ import random
 from torch import nn
 from validators import Max
 from MainClasses.HiPool import HiPool, HiPoolPlus, HiPoolFixed
+def _ensure_mask(mask, x):
+    if mask is None:
+        return None
+    if mask.dim() == 2:
+        return mask.unsqueeze(-1)
+    return mask
+
+
 class MaxPool(nn.Module):
     def __init__(self):
         super().__init__()
         pass
-    def forward(self, x):
+    def forward(self, x, mask=None):
+        mask = _ensure_mask(mask, x)
+        if mask is not None:
+            masked = x.masked_fill(mask == 0, torch.finfo(x.dtype).min)
+            return torch.max(masked, dim=1)[0]
         return torch.max(x, dim=1)[0]
 
 class AvgPool(nn.Module):
     def __init__(self):
         super().__init__()
         pass
-    def forward(self, x):
+    def forward(self, x, mask=None):
+        mask = _ensure_mask(mask, x)
+        if mask is not None:
+            denom = mask.sum(dim=1).clamp_min(1.0)
+            return (x * mask).sum(dim=1) / denom
         return torch.mean(x, dim=1)
 
 class LinearSoftmaxPool(nn.Module):
     def __init__(self):
         super().__init__()
         pass
-    def forward(self, x):
+    def forward(self, x, mask=None):
+        mask = _ensure_mask(mask, x)
+        if mask is not None:
+            numerator = torch.sum((x ** 2) * mask, dim=1)
+            denominator = torch.sum(x * mask, dim=1).clamp_min(1e-8)
+            return numerator / denominator
         return torch.sum(x ** 2, dim=1) / torch.sum(x, dim=1)
 
 class ExpSoftmaxPool(nn.Module):
     def __init__(self):
         super().__init__()
         pass
-    def forward(self, x):
-        return (torch.sum(x * torch.exp(x), dim=1) / torch.sum(torch.exp(x), dim=1))
+    def forward(self, x, mask=None):
+        mask = _ensure_mask(mask, x)
+        exp_x = torch.exp(x)
+        if mask is not None:
+            numerator = torch.sum(x * exp_x * mask, dim=1)
+            denominator = torch.sum(exp_x * mask, dim=1).clamp_min(1e-8)
+            return numerator / denominator
+        return (torch.sum(x * exp_x, dim=1) / torch.sum(exp_x, dim=1))
 
 class AttentionPool(nn.Module):
     def __init__(self, seq_len):
         super(AttentionPool, self).__init__()
         self.linear = nn.Linear(seq_len, seq_len)
-    def forward(self, inputs):
+    def forward(self, inputs, mask=None):
         alphas = torch.sigmoid(self.linear(inputs.permute(0, 2, 1)))
         alphas = alphas.permute(0, 2, 1)
+        mask = _ensure_mask(mask, inputs)
+        if mask is not None:
+            alphas = alphas * mask
+            denom = alphas.sum(dim=1).clamp_min(1e-8)
+            return torch.sum(inputs * alphas, dim=1) / denom
         return torch.sum(inputs * alphas, dim=1) / torch.sum(alphas, dim=1)
 
 class AutoPool(nn.Module):
@@ -56,8 +88,11 @@ class AutoPool(nn.Module):
         self.time_axis = time_axis
         self.alpha = nn.Parameter(torch.zeros(1, n_classes), requires_grad=True)
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         scaled = self.alpha * x
+        mask = _ensure_mask(mask, x)
+        if mask is not None:
+            scaled = scaled.masked_fill(mask == 0, torch.finfo(x.dtype).min)
         weights = torch.softmax(scaled, dim=self.time_axis)
         return (x * weights).sum(dim=self.time_axis)
 
@@ -69,8 +104,13 @@ class PowerPool(nn.Module):
         super(PowerPool, self).__init__()
         self.time_axis = time_axis
         self.n = nn.Parameter(torch.zeros(1, input_size), requires_grad=True)
-    def forward(self, x):
+    def forward(self, x, mask=None):
         scaled = torch.pow(x, self.n)
+        mask = _ensure_mask(mask, x)
+        if mask is not None:
+            numerator = torch.sum(x * scaled * mask, dim=1)
+            denominator = torch.sum(scaled * mask, dim=1).clamp_min(1e-8)
+            return numerator / denominator
         return torch.sum(x * scaled, dim=1) / torch.sum(scaled, dim=1)
 
 
