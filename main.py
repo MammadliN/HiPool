@@ -235,6 +235,43 @@ def get_max_duration(segments: List[AudioSegment]) -> float:
         for seg in segments
     )
 
+
+def load_strong_labels(csv_path: str, allowed_levels: List[str]) -> Dict[str, List[Dict[str, object]]]:
+    df = pd.read_csv(csv_path)
+    if allowed_levels:
+        df = df[df["level"].isin(allowed_levels)]
+    df["file_stem"] = df["file_name"].str.replace(".txt", "", regex=False)
+    events: Dict[str, List[Dict[str, object]]] = {}
+    for _, row in df.iterrows():
+        events.setdefault(row["file_stem"], []).append(
+            {
+                "start": float(row["start_second"]),
+                "end": float(row["end_second"]),
+                "label": str(row["label"]),
+            }
+        )
+    return events
+
+
+def strong_label_vector(
+    events: List[Dict[str, object]],
+    class_columns: List[str],
+    start_sec: float,
+    end_sec: float,
+) -> np.ndarray:
+    label_vec = np.zeros(len(class_columns), dtype=np.float32)
+    if not events:
+        return label_vec
+    for event in events:
+        if event["end"] > start_sec and event["start"] < end_sec:
+            if event["label"] in class_columns:
+                idx = class_columns.index(event["label"])
+                label_vec[idx] = 1.0
+    return label_vec
+
+
+def anuraset_file_stem(audio_path: str) -> str:
+    return os.path.splitext(os.path.basename(audio_path))[0]
 def get_class_columns(metadata: pd.DataFrame, target_species: List[str]) -> List[str]:
     start_idx = metadata.columns.get_loc("subset") + 1
     all_species = list(metadata.columns[start_idx:])
@@ -568,6 +605,9 @@ if __name__ == "__main__":
     APPLY_TEST_SPLIT = config.APPLY_TEST_SPLIT
 
     TARGET_SPECIES = config.TARGET_SPECIES
+    STRONG_LABELS_458 = config.STRONG_LABELS_458
+    STRONG_LABELS_578 = config.STRONG_LABELS_578
+    STRONG_LABEL_LEVELS = config.STRONG_LABEL_LEVELS
 
     pool_map = {
         "max": "max_pool",
@@ -661,6 +701,12 @@ if __name__ == "__main__":
             seed=config.SEED,
         )
 
+    fnjv_id = "578" if "578" in FNJV_ROOT else "458"
+    strong_labels_path = STRONG_LABELS_578 if fnjv_id == "578" else STRONG_LABELS_458
+    strong_events = None
+    if os.path.exists(strong_labels_path):
+        strong_events = load_strong_labels(strong_labels_path, STRONG_LABEL_LEVELS)
+
     if APPLY_VALIDATION_SPLIT or APPLY_TEST_SPLIT:
         fnjv_train_segments, fnjv_val_segments, fnjv_test_segments = split_segments(
             fnjv_segments,
@@ -687,6 +733,42 @@ if __name__ == "__main__":
         test_segments = anura_test_segments
     else:
         test_segments = fnjv_test_segments
+
+    if strong_events is not None:
+        if DATASET_VAL == "AnuraSet":
+            updated_segments = []
+            for seg in val_segments:
+                stem = anuraset_file_stem(seg.audio_path)
+                events = strong_events.get(stem, [])
+                label = strong_label_vector(events, class_columns, seg.start_sec, seg.end_sec)
+                updated_segments.append(
+                    AudioSegment(
+                        audio_path=seg.audio_path,
+                        start_sec=seg.start_sec,
+                        end_sec=seg.end_sec,
+                        label=label,
+                        segment_id=seg.segment_id,
+                        duration_sec=seg.duration_sec,
+                    )
+                )
+            val_segments = updated_segments
+        if DATASET_TEST == "AnuraSet":
+            updated_segments = []
+            for seg in test_segments:
+                stem = anuraset_file_stem(seg.audio_path)
+                events = strong_events.get(stem, [])
+                label = strong_label_vector(events, class_columns, seg.start_sec, seg.end_sec)
+                updated_segments.append(
+                    AudioSegment(
+                        audio_path=seg.audio_path,
+                        start_sec=seg.start_sec,
+                        end_sec=seg.end_sec,
+                        label=label,
+                        segment_id=seg.segment_id,
+                        duration_sec=seg.duration_sec,
+                    )
+                )
+            test_segments = updated_segments
 
     if full_bag and FULL_BAG_METHOD == "pad":
         max_duration_sec = max(
@@ -827,6 +909,7 @@ if __name__ == "__main__":
     print(">>> [config] APPLY_VALIDATION_SPLIT=", APPLY_VALIDATION_SPLIT)
     print(">>> [config] APPLY_TEST_SPLIT=", APPLY_TEST_SPLIT)
     print(">>> [config] TARGET_SPECIES=", TARGET_SPECIES)
+    print(">>> [config] STRONG_LABEL_LEVELS=", STRONG_LABEL_LEVELS)
     print(">>> [config] sample_rate=", sample_rate)
     print(">>> [config] n_mels=", n_mels)
     print(">>> [config] n_fft=", n_fft)
