@@ -76,7 +76,7 @@ class AudioSegmentDataset(Dataset):
         logmelspec = librosa.power_to_db(melspec)
         return logmelspec.T
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str, int]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str, int, str, float, float]:
         seg = self.segments[idx]
         audio = self._load_segment(seg.audio_path, seg.start_sec, seg.end_sec)
         feats = self._extract_logmel(audio)
@@ -86,6 +86,9 @@ class AudioSegmentDataset(Dataset):
             torch.from_numpy(seg.label).float(),
             seg.segment_id,
             frames_len,
+            seg.audio_path,
+            seg.start_sec,
+            seg.end_sec,
         )
 
 
@@ -189,12 +192,12 @@ def pool_requires_fixed_seq_len(pool_style: str) -> bool:
 
 
 def collate_default(batch):
-    feats, labels, ids, _lengths = zip(*batch)
-    return torch.stack(feats), torch.stack(labels), list(ids), None
+    feats, labels, ids, _lengths, paths, starts, ends = zip(*batch)
+    return torch.stack(feats), torch.stack(labels), list(ids), None, list(paths), list(starts), list(ends)
 
 
 def collate_full_bag_pad(batch, fixed_frames: int, pad_mode: str):
-    feats, labels, ids, lengths = zip(*batch)
+    feats, labels, ids, lengths, paths, starts, ends = zip(*batch)
     padded = []
     masks = []
     for feat, length in zip(feats, lengths):
@@ -224,7 +227,7 @@ def collate_full_bag_pad(batch, fixed_frames: int, pad_mode: str):
         mask = torch.stack(masks)
     else:
         mask = None
-    return x, y, list(ids), mask
+    return x, y, list(ids), mask, list(paths), list(starts), list(ends)
 
 
 def get_max_duration(segments: List[AudioSegment]) -> float:
@@ -474,19 +477,116 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, threshold: float) ->
     }
 
 
+def compute_class_f1(y_true: np.ndarray, y_pred: np.ndarray, threshold: float) -> np.ndarray:
+    y_hat = (y_pred >= threshold).astype(np.int32)
+    tp = (y_hat * y_true).sum(axis=0)
+    fp = (y_hat * (1 - y_true)).sum(axis=0)
+    fn = ((1 - y_hat) * y_true).sum(axis=0)
+    precision = tp / (tp + fp + 1e-10)
+    recall = tp / (tp + fn + 1e-10)
+    f1 = 2 * precision * recall / (precision + recall + 1e-10)
+    return f1
+
+
+def localization_frame_labels(
+    events: List[Dict[str, object]],
+    class_columns: List[str],
+    start_sec: float,
+    end_sec: float,
+    frame_count: int,
+) -> np.ndarray:
+    labels = np.zeros((frame_count, len(class_columns)), dtype=np.float32)
+    if not events or frame_count <= 0:
+        return labels
+    duration = max(end_sec - start_sec, 1e-6)
+    frames_per_sec = frame_count / duration
+    for event in events:
+        if event["end"] <= start_sec or event["start"] >= end_sec:
+            continue
+        if event["label"] not in class_columns:
+            continue
+        class_idx = class_columns.index(event["label"])
+        onset = max(event["start"], start_sec) - start_sec
+        offset = min(event["end"], end_sec) - start_sec
+        start_frame = int(np.floor(onset * frames_per_sec))
+        end_frame = int(np.ceil(offset * frames_per_sec))
+        start_frame = max(0, min(frame_count, start_frame))
+        end_frame = max(0, min(frame_count, end_frame))
+        if end_frame > start_frame:
+            labels[start_frame:end_frame, class_idx] = 1.0
+    return labels
+
+
+def evaluate_localization(
+    model: nn.Module,
+    loader: DataLoader,
+    strong_events: Dict[str, List[Dict[str, object]]],
+    class_columns: List[str],
+    threshold: float,
+    device: torch.device,
+) -> Tuple[Dict[str, float], np.ndarray]:
+    model.eval()
+    preds = []
+    targets = []
+    with torch.no_grad():
+        for x_data, _y_data, _ids, mask, paths, starts, ends in loader:
+            x_data = x_data.to(device)
+            if mask is not None:
+                mask = mask.to(device)
+                _y_pred, y_frames = model(x_data, mask=mask)
+            else:
+                _y_pred, y_frames = model(x_data)
+            y_frames = y_frames.cpu().numpy()
+            mask_np = mask.cpu().numpy() if mask is not None else None
+            for i in range(len(paths)):
+                file_stem = anuraset_file_stem(paths[i])
+                events = strong_events.get(file_stem, [])
+                frames_len = y_frames[i].shape[0]
+                if mask_np is not None:
+                    frames_len = int(mask_np[i].sum())
+                    frames_len = max(frames_len, 1)
+                    frame_pred = y_frames[i][:frames_len]
+                else:
+                    frame_pred = y_frames[i]
+                frame_true = localization_frame_labels(
+                    events,
+                    class_columns,
+                    float(starts[i]),
+                    float(ends[i]),
+                    frames_len,
+                )
+                preds.append(frame_pred)
+                targets.append(frame_true)
+    if not preds:
+        return {
+            "micro_precision": 0.0,
+            "micro_recall": 0.0,
+            "micro_f1": 0.0,
+            "macro_precision": 0.0,
+            "macro_recall": 0.0,
+            "macro_f1": 0.0,
+        }, np.zeros(len(class_columns), dtype=np.float32)
+    y_pred = np.concatenate(preds, axis=0)
+    y_true = np.concatenate(targets, axis=0)
+    metrics = compute_metrics(y_true, y_pred, threshold)
+    class_f1 = compute_class_f1(y_true, y_pred, threshold)
+    return metrics, class_f1
+
+
 def evaluate_model(
     model: nn.Module,
     loader: DataLoader,
     loss_fn: nn.Module,
     device: torch.device,
     threshold: float,
-) -> Tuple[float, Dict[str, float]]:
+    return_arrays: bool = False,
+) -> Tuple[float, Dict[str, float], Optional[np.ndarray], Optional[np.ndarray]]:
     model.eval()
     losses = []
     preds = []
     targets = []
     with torch.no_grad():
-        for x_data, y_data, _, mask in loader:
+        for x_data, y_data, _, mask, _paths, _starts, _ends in loader:
             x_data = x_data.to(device)
             y_data = y_data.to(device)
             if mask is not None:
@@ -501,7 +601,9 @@ def evaluate_model(
     y_pred = np.concatenate(preds, axis=0)
     y_true = np.concatenate(targets, axis=0)
     metrics = compute_metrics(y_true, y_pred, threshold)
-    return float(np.mean(losses)), metrics
+    if return_arrays:
+        return float(np.mean(losses)), metrics, y_true, y_pred
+    return float(np.mean(losses)), metrics, None, None
 
 
 def plot_training_history(history: Dict[str, List[float]], output_path: str) -> None:
@@ -923,7 +1025,7 @@ if __name__ == "__main__":
         train_losses = []
         train_preds = []
         train_targets = []
-        for x_data, y_data, _, mask in train_loader:
+        for x_data, y_data, _, mask, _paths, _starts, _ends in train_loader:
             x_data = x_data.to(device)
             y_data = y_data.to(device)
             if mask is not None:
@@ -947,7 +1049,7 @@ if __name__ == "__main__":
             threshold,
         )
 
-        test_loss, test_metrics = evaluate_model(model, val_loader, loss_fn, device, threshold)
+        test_loss, test_metrics, _, _ = evaluate_model(model, val_loader, loss_fn, device, threshold)
 
         history["train_loss"].append(train_loss)
         history["test_loss"].append(test_loss)
@@ -1006,22 +1108,59 @@ if __name__ == "__main__":
             )
         )
 
-    best_macro_model = build_model(MODEL_NAME, num_classes, pool_style, train_dataset.seq_len, n_mels).to(device)
+    best_macro_model = build_model(MODEL_NAME, num_classes, pool_style, model_seq_len, n_mels).to(device)
     best_macro_model.load_state_dict(torch.load(best_macro_path, map_location=device))
-    macro_test_loss, macro_test_metrics = evaluate_model(
-        best_macro_model, test_loader, loss_fn, device, threshold
+    macro_test_loss, macro_test_metrics, macro_y_true, macro_y_pred = evaluate_model(
+        best_macro_model, test_loader, loss_fn, device, threshold, return_arrays=True
     )
+    macro_class_f1 = compute_class_f1(macro_y_true, macro_y_pred, threshold)
 
-    best_micro_model = build_model(MODEL_NAME, num_classes, pool_style, train_dataset.seq_len, n_mels).to(device)
+    best_micro_model = build_model(MODEL_NAME, num_classes, pool_style, model_seq_len, n_mels).to(device)
     best_micro_model.load_state_dict(torch.load(best_micro_path, map_location=device))
-    micro_test_loss, micro_test_metrics = evaluate_model(
-        best_micro_model, test_loader, loss_fn, device, threshold
+    micro_test_loss, micro_test_metrics, micro_y_true, micro_y_pred = evaluate_model(
+        best_micro_model, test_loader, loss_fn, device, threshold, return_arrays=True
     )
+    micro_class_f1 = compute_class_f1(micro_y_true, micro_y_pred, threshold)
 
     print("Best Macro Model Test Results")
     print(f"Loss: {macro_test_loss:.4f}")
     print(macro_test_metrics)
+    print("Macro Model Class F1:")
+    for class_name, f1_value in zip(class_columns, macro_class_f1):
+        print(f"  {class_name}: {f1_value:.4f}")
 
     print("Best Micro Model Test Results")
     print(f"Loss: {micro_test_loss:.4f}")
     print(micro_test_metrics)
+    print("Micro Model Class F1:")
+    for class_name, f1_value in zip(class_columns, micro_class_f1):
+        print(f"  {class_name}: {f1_value:.4f}")
+
+    if strong_events is not None and DATASET_TEST == "AnuraSet":
+        loc_metrics_macro, loc_class_f1_macro = evaluate_localization(
+            best_macro_model,
+            test_loader,
+            strong_events,
+            class_columns,
+            threshold,
+            device,
+        )
+        print("Macro Model Localization Metrics")
+        print(loc_metrics_macro)
+        print("Macro Model Localization Class F1:")
+        for class_name, f1_value in zip(class_columns, loc_class_f1_macro):
+            print(f"  {class_name}: {f1_value:.4f}")
+
+        loc_metrics_micro, loc_class_f1_micro = evaluate_localization(
+            best_micro_model,
+            test_loader,
+            strong_events,
+            class_columns,
+            threshold,
+            device,
+        )
+        print("Micro Model Localization Metrics")
+        print(loc_metrics_micro)
+        print("Micro Model Localization Class F1:")
+        for class_name, f1_value in zip(class_columns, loc_class_f1_micro):
+            print(f"  {class_name}: {f1_value:.4f}")
