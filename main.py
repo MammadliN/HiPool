@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader, Dataset
 import config
 from MainClasses.Models import Baseline, CDur, TALNet
 from MainClasses.MILPooling import MILPooling
+from MainClasses.loc_vad import activity_detection
 
 
 @dataclass
@@ -573,6 +574,144 @@ def evaluate_localization(
     return metrics, class_f1
 
 
+def binarize_with_activity_detection(
+    frame_pred: np.ndarray,
+    class_columns: List[str],
+    thresholds: Dict[str, float],
+) -> np.ndarray:
+    n_frames, n_classes = frame_pred.shape
+    binary = np.zeros((n_frames, n_classes), dtype=np.float32)
+    for k in range(n_classes):
+        pairs = activity_detection(
+            x=frame_pred[:, k],
+            thres=thresholds["loc_threshold_high"],
+            low_thres=thresholds["loc_threshold_low"],
+            n_smooth=thresholds["smooth"],
+            n_salt=thresholds["smooth"],
+        )
+        for onset, offset in pairs:
+            onset = max(0, min(n_frames, int(onset)))
+            offset = max(0, min(n_frames, int(offset)))
+            if offset > onset:
+                binary[onset:offset, k] = 1.0
+    return binary
+
+
+def visualize_predictions(
+    model: nn.Module,
+    loader: DataLoader,
+    strong_events: Dict[str, List[Dict[str, object]]],
+    class_columns: List[str],
+    thresholds: Dict[str, float],
+    output_root: str,
+    prefix: str,
+    max_per_class: int = 5,
+) -> None:
+    model.eval()
+    selections = {name: {"correct": [], "wrong": []} for name in class_columns}
+    with torch.no_grad():
+        for x_data, y_data, _ids, mask, paths, starts, ends in loader:
+            device = next(model.parameters()).device
+            x_data = x_data.to(device)
+            if mask is not None:
+                mask = mask.to(x_data.device)
+                clip_out, frame_out = model(x_data, mask=mask)
+            else:
+                clip_out, frame_out = model(x_data)
+            clip_out = clip_out.cpu().numpy()
+            frame_out = frame_out.cpu().numpy()
+            mask_np = mask.cpu().numpy() if mask is not None else None
+            y_true = y_data.cpu().numpy()
+            for i in range(len(paths)):
+                file_stem = anuraset_file_stem(paths[i])
+                events = strong_events.get(file_stem, [])
+                frame_pred = frame_out[i]
+                if mask_np is not None:
+                    valid_len = int(mask_np[i].sum())
+                    valid_len = max(valid_len, 1)
+                    frame_pred = frame_pred[:valid_len]
+                frame_true = localization_frame_labels(
+                    events,
+                    class_columns,
+                    float(starts[i]),
+                    float(ends[i]),
+                    frame_pred.shape[0],
+                )
+                for class_idx, class_name in enumerate(class_columns):
+                    if len(selections[class_name]["correct"]) >= max_per_class and len(
+                        selections[class_name]["wrong"]
+                    ) >= max_per_class:
+                        continue
+                    pred = clip_out[i, class_idx] >= thresholds["tag_threshold"]
+                    target = y_true[i, class_idx] >= 0.5
+                    bucket = "correct" if pred == target else "wrong"
+                    if len(selections[class_name][bucket]) >= max_per_class:
+                        continue
+                    selections[class_name][bucket].append(
+                        {
+                            "class_idx": class_idx,
+                            "class_name": class_name,
+                            "audio_path": paths[i],
+                            "start": float(starts[i]),
+                            "end": float(ends[i]),
+                            "clip_out": clip_out[i],
+                            "frame_pred": frame_pred,
+                            "frame_true": frame_true,
+                            "target": y_true[i],
+                        }
+                    )
+
+    for class_name, buckets in selections.items():
+        for bucket_name, samples in buckets.items():
+            out_dir = os.path.join(output_root, class_name, bucket_name)
+            os.makedirs(out_dir, exist_ok=True)
+            for sample in samples:
+                frame_pred = sample["frame_pred"]
+                frame_true = sample["frame_true"]
+                clip_out = sample["clip_out"]
+                target = sample["target"]
+                active_classes = np.where(target >= 0.5)[0].tolist()
+                if not active_classes:
+                    active_classes = [sample["class_idx"]]
+                active_names = [class_columns[idx] for idx in active_classes]
+                clip_len = max(sample["end"] - sample["start"], 1e-6)
+                seq_len = frame_pred.shape[0]
+                t_sec = np.arange(seq_len) * (clip_len / seq_len)
+
+                fig, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
+                gt_data = frame_true[:, active_classes].T
+                axes[0].imshow(gt_data, aspect="auto", origin="lower", extent=[0, clip_len, 0, len(active_classes)])
+                axes[0].set_yticks(np.arange(len(active_classes)) + 0.5)
+                axes[0].set_yticklabels(active_names)
+                axes[0].set_title("Ground Truth (strong labels)")
+
+                for idx in active_classes:
+                    axes[1].plot(clip_out[idx] * np.ones_like(t_sec), label=class_columns[idx])
+                axes[1].axhline(thresholds["tag_threshold"], color="red", linestyle="--", linewidth=1)
+                axes[1].set_title("Clip-wise predictions")
+                axes[1].legend(loc="upper right")
+
+                pred_data = frame_pred[:, active_classes].T
+                axes[2].imshow(pred_data, aspect="auto", origin="lower", extent=[0, clip_len, 0, len(active_classes)])
+                axes[2].set_yticks(np.arange(len(active_classes)) + 0.5)
+                axes[2].set_yticklabels(active_names)
+                axes[2].set_title("Frame-wise predictions")
+
+                binary = binarize_with_activity_detection(frame_pred, class_columns, thresholds)
+                binary_data = binary[:, active_classes].T
+                axes[3].imshow(binary_data, aspect="auto", origin="lower", extent=[0, clip_len, 0, len(active_classes)])
+                axes[3].set_yticks(np.arange(len(active_classes)) + 0.5)
+                axes[3].set_yticklabels(active_names)
+                axes[3].set_title("Frame-wise predictions (VAD)")
+                axes[3].set_xlabel("Time (s)")
+
+                fig.tight_layout()
+                audio_name = os.path.basename(sample["audio_path"]).replace(".wav", "")
+                fig_path = os.path.join(out_dir, f"{audio_name}_{prefix}_{class_name}.png")
+                fig.savefig(fig_path)
+                plt.close(fig)
+
+
 def evaluate_model(
     model: nn.Module,
     loader: DataLoader,
@@ -710,6 +849,7 @@ if __name__ == "__main__":
     STRONG_LABELS_458 = config.STRONG_LABELS_458
     STRONG_LABELS_578 = config.STRONG_LABELS_578
     STRONG_LABEL_LEVELS = config.STRONG_LABEL_LEVELS
+    ANURASET_EVAL = config.ANURASET_EVAL
 
     pool_map = {
         "max": "max_pool",
@@ -1012,6 +1152,7 @@ if __name__ == "__main__":
     print(">>> [config] APPLY_TEST_SPLIT=", APPLY_TEST_SPLIT)
     print(">>> [config] TARGET_SPECIES=", TARGET_SPECIES)
     print(">>> [config] STRONG_LABEL_LEVELS=", STRONG_LABEL_LEVELS)
+    print(">>> [config] ANURASET_EVAL=", ANURASET_EVAL)
     print(">>> [config] sample_rate=", sample_rate)
     print(">>> [config] n_mels=", n_mels)
     print(">>> [config] n_fft=", n_fft)
@@ -1164,3 +1305,22 @@ if __name__ == "__main__":
         print("Micro Model Localization Class F1:")
         for class_name, f1_value in zip(class_columns, loc_class_f1_micro):
             print(f"  {class_name}: {f1_value:.4f}")
+
+        visualize_predictions(
+            best_macro_model,
+            test_loader,
+            strong_events,
+            class_columns,
+            ANURASET_EVAL,
+            output_root="results/AnuraSet/viz",
+            prefix="macro",
+        )
+        visualize_predictions(
+            best_micro_model,
+            test_loader,
+            strong_events,
+            class_columns,
+            ANURASET_EVAL,
+            output_root="results/AnuraSet/viz",
+            prefix="micro",
+        )

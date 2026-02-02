@@ -58,3 +58,11 @@ STRONG_LABELS_578 = "/ds-iml/Bioacoustics/AnuraSet/strong_labels/FNJV_578_specie
 
 # STRONG_LABEL_LEVELS can include any of: "High", "Medium", "Low".
 STRONG_LABEL_LEVELS = ["High", "Medium", "Low"]
+
+# AnuraSet eval thresholds for visualization/localization.
+ANURASET_EVAL = {
+    "tag_threshold": 0.5,
+    "loc_threshold_high": 0.3,
+    "loc_threshold_low": 0.1,
+    "smooth": 10,
+}

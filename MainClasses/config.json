@@ -78,5 +78,23 @@
       "loc_threshold_low": 0.3,
       "smooth": 10
     }
+  },
+  "AnuraSet":{
+    "data":{
+      "sr": 22000,
+      "sample_width": 1100,
+      "sample_step": 550,
+      "clip_len": 60,
+      "seq_len": 2400,
+      "n_mels": 64,
+      "labels": [],
+      "root": "/ds-iml/Bioacoustics/AnuraSet/raw_data"
+    },
+    "eval":{
+      "tag_threshold": 0.5,
+      "loc_threshold_high": 0.3,
+      "loc_threshold_low": 0.1,
+      "smooth": 10
+    }
   }
 }
