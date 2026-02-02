@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+from torch.nn import functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
@@ -125,6 +126,7 @@ class CNNBiGRU(nn.Module):
         x = x.transpose(1, 2).flatten(2)
         x, _ = self.gru(x)
         y_frames = torch.sigmoid(self.out(x)).clamp(1e-7, 1.0)
+        mask = downsample_mask(mask, y_frames.shape[1])
         y_clip = pool_with_mask(self.pool, y_frames, mask)
         return y_clip, y_frames
 
@@ -162,6 +164,7 @@ class CNNTransformer(nn.Module):
         x = x.transpose(1, 2).flatten(2)
         x = self.transformer(x)
         y_frames = torch.sigmoid(self.out(x)).clamp(1e-7, 1.0)
+        mask = downsample_mask(mask, y_frames.shape[1])
         y_clip = pool_with_mask(self.pool, y_frames, mask)
         return y_clip, y_frames
 
@@ -176,6 +179,19 @@ def set_seed(seed: int) -> None:
 def compute_frames(duration_sec: float, sample_rate: int, n_fft: int, hop_length: int) -> int:
     frames = int(np.floor((duration_sec * sample_rate - n_fft) / hop_length) + 1)
     return max(frames, 1)
+
+
+def downsample_mask(mask: torch.Tensor, target_len: int) -> torch.Tensor:
+    if mask is None or mask.shape[1] == target_len:
+        return mask
+    if target_len <= 0:
+        return mask[:, :0]
+    source_len = mask.shape[1]
+    mask_1d = mask.unsqueeze(1)
+    if source_len % target_len == 0:
+        factor = source_len // target_len
+        return F.max_pool1d(mask_1d, kernel_size=factor, stride=factor).squeeze(1)
+    return F.interpolate(mask_1d, size=target_len, mode="nearest").squeeze(1)
 
 
 def pool_with_mask(pool, y_frames, mask=None):
