@@ -9,6 +9,7 @@ import random
 from h5py import File
 import pandas as pd
 import json
+import config as mc
 '''
 This class defines the operations of datasets.
 '''
@@ -17,6 +18,17 @@ class DataHandler:
     def __init__(self, dataset):
         self.dataset = dataset
         self.config = json.load(open('./MainClasses/config.json', 'r'))[self.dataset]
+        if self.dataset == "AnuraSet":
+            self.config["data"]["sr"] = mc.sample_rate
+            self.config["data"]["sample_width"] = mc.n_fft
+            self.config["data"]["sample_step"] = mc.hop_length
+            self.config["data"]["n_mels"] = mc.n_mels
+            if mc.BAG_SECONDS == "full":
+                self.config["data"]["clip_len"] = 60
+            else:
+                self.config["data"]["clip_len"] = mc.BAG_SECONDS
+            self.config["data"]["labels"] = mc.TARGET_SPECIES or self.config["data"]["labels"]
+            self.config["eval"].update(mc.ANURASET_EVAL)
         self.root = self.config['data']['root']
         self.sr = self.config['data']['sr']
         self.frame_width = self.config['data']['sample_width']
@@ -220,6 +232,87 @@ class DataHandler:
                 y_data['filenames'] += synthetic_weak_dict['filenames']
                 y_data['labels'] = np.concatenate([y_data['labels'], synthetic_weak_dict['labels']])
         return x_data, y_data
+
+    def load_anuraset(self, type_):
+        metadata_path = os.path.join(self.root, "metadata.csv")
+        metadata = pd.read_csv(metadata_path)
+        subset = "train" if type_ == "training" else "test"
+        subset_meta = metadata[metadata["subset"] == subset]
+        class_columns = list(metadata.columns[metadata.columns.get_loc("subset") + 1 :])
+        if mc.TARGET_SPECIES:
+            class_columns = [col for col in class_columns if col in mc.TARGET_SPECIES]
+
+        strong_csv = mc.STRONG_LABELS_578 if "578" in mc.FNJV_ROOT else mc.STRONG_LABELS_458
+        strong_events = None
+        if os.path.exists(strong_csv):
+            strong_df = pd.read_csv(strong_csv)
+            if mc.STRONG_LABEL_LEVELS:
+                strong_df = strong_df[strong_df["level"].isin(mc.STRONG_LABEL_LEVELS)]
+            strong_df["file_stem"] = strong_df["file_name"].str.replace(".txt", "", regex=False)
+            strong_events = {}
+            for _, row in strong_df.iterrows():
+                strong_events.setdefault(row["file_stem"], []).append(
+                    {
+                        "start": float(row["start_second"]),
+                        "end": float(row["end_second"]),
+                        "label": str(row["label"]),
+                    }
+                )
+
+        data = []
+        labels = []
+        audio_files = []
+        fw = self.frame_width
+        fs = self.frame_step
+        nframe = int(np.floor((self.clip_len * self.sr - fw) / fs) + 1)
+        for _, row in subset_meta.groupby(["site", "fname"]).first().iterrows():
+            fname = row["fname"]
+            site = row["site"]
+            audio_path = os.path.join(self.root, site, f"{fname}.wav")
+            try:
+                s, _ = lrs.load(audio_path, sr=self.sr)
+            except Exception:
+                continue
+            s = self.seq_norm(s, max_secs=self.clip_len)
+            s = np.array(s).reshape((-1, 1))
+            s = np.concatenate((s[0:1], s[1:] - 0.97 * s[:-1]))
+            melspec = lrs.feature.melspectrogram(
+                y=s.squeeze(),
+                sr=self.sr,
+                n_fft=fw,
+                hop_length=fs,
+                n_mels=self.n_mels,
+                win_length=fw,
+                center=False,
+                window="hamming",
+            )
+            logmelspec = lrs.power_to_db(melspec).T
+            if logmelspec.shape[0] < nframe:
+                pad = np.zeros((nframe - logmelspec.shape[0], self.n_mels), dtype=logmelspec.dtype)
+                logmelspec = np.concatenate([logmelspec, pad], axis=0)
+            elif logmelspec.shape[0] > nframe:
+                logmelspec = logmelspec[:nframe]
+            data.append(self.standardization(logmelspec))
+            audio_files.append(fname)
+            if strong_events is not None:
+                events = strong_events.get(fname, [])
+                strong = np.zeros((nframe, len(class_columns)), dtype=np.float32)
+                frames_per_sec = nframe / self.clip_len
+                for event in events:
+                    if event["label"] not in class_columns:
+                        continue
+                    class_idx = class_columns.index(event["label"])
+                    start_frame = int(np.floor(event["start"] * frames_per_sec))
+                    end_frame = int(np.ceil(event["end"] * frames_per_sec))
+                    start_frame = max(0, min(nframe, start_frame))
+                    end_frame = max(0, min(nframe, end_frame))
+                    if end_frame > start_frame:
+                        strong[start_frame:end_frame, class_idx] = 1.0
+                labels.append(strong)
+            else:
+                weak = subset_meta[subset_meta["fname"] == fname][class_columns].max().values.astype(np.float32)
+                labels.append(weak)
+        return data, labels, audio_files
 
     def ann_to_labels_dcase17(self, ann_file, type):
         root = '../sed_data/dcase/sound_event_list_17_classes.txt'
