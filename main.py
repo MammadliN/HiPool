@@ -725,7 +725,6 @@ def visualize_predictions(
             for sample in samples:
                 frame_pred = sample["frame_pred"]
                 frame_true = sample["frame_true"]
-                clip_out = sample["clip_out"]
                 target = sample["target"]
                 active_classes = np.where(target >= 0.5)[0].tolist()
                 if not active_classes:
@@ -735,33 +734,80 @@ def visualize_predictions(
                 seq_len = frame_pred.shape[0]
                 t_sec = np.arange(seq_len) * (clip_len / seq_len)
 
-                fig, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
+                def build_spacer_rows(data: np.ndarray, labels: List[str]) -> Tuple[np.ndarray, List[str]]:
+                    k = len(labels)
+                    if k == 1:
+                        rows = 5
+                        layout = ["...", "...", labels[0], "...", "..."]
+                        out = np.zeros((rows, data.shape[1]), dtype=data.dtype)
+                        out[2] = data[0]
+                        return out, layout
+                    rows = 2 * k + 1
+                    out = np.zeros((rows, data.shape[1]), dtype=data.dtype)
+                    layout = ["..."] * rows
+                    for idx in range(k):
+                        row_idx = 1 + 2 * idx
+                        out[row_idx] = data[idx]
+                        layout[row_idx] = labels[idx]
+                    return out, layout
+
+                fig, axes = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
                 gt_data = frame_true[:, active_classes].T
-                axes[0].imshow(gt_data, aspect="auto", origin="lower", extent=[0, clip_len, 0, len(active_classes)])
-                axes[0].set_yticks(np.arange(len(active_classes)) + 0.5)
-                axes[0].set_yticklabels(active_names)
+                gt_plot, y_labels = build_spacer_rows(gt_data, active_names)
+                im0 = axes[0].imshow(
+                    gt_plot,
+                    aspect="auto",
+                    origin="lower",
+                    extent=[0, clip_len, 0, gt_plot.shape[0]],
+                    vmin=0,
+                    vmax=1,
+                    cmap="Greys",
+                )
+                axes[0].set_yticks(np.arange(gt_plot.shape[0]) + 0.5)
+                axes[0].set_yticklabels(y_labels)
                 axes[0].set_title("Ground Truth (strong labels)")
 
                 for idx in active_classes:
-                    axes[1].plot(clip_out[idx] * np.ones_like(t_sec), label=class_columns[idx])
-                axes[1].axhline(thresholds["tag_threshold"], color="red", linestyle="--", linewidth=1)
-                axes[1].set_title("Clip-wise predictions")
+                    axes[1].plot(t_sec, frame_pred[:, idx], label=class_columns[idx])
+                axes[1].axhline(thresholds["loc_threshold_high"], color="red", linestyle="--", linewidth=1)
+                axes[1].axhline(thresholds["loc_threshold_low"], color="orange", linestyle="--", linewidth=1)
+                axes[1].set_ylim(0, 1)
+                axes[1].set_title("Frame-wise probabilities (line plot)")
                 axes[1].legend(loc="upper right")
 
                 pred_data = frame_pred[:, active_classes].T
-                axes[2].imshow(pred_data, aspect="auto", origin="lower", extent=[0, clip_len, 0, len(active_classes)])
-                axes[2].set_yticks(np.arange(len(active_classes)) + 0.5)
-                axes[2].set_yticklabels(active_names)
-                axes[2].set_title("Frame-wise predictions")
+                pred_plot, _ = build_spacer_rows(pred_data, active_names)
+                im2 = axes[2].imshow(
+                    pred_plot,
+                    aspect="auto",
+                    origin="lower",
+                    extent=[0, clip_len, 0, pred_plot.shape[0]],
+                    vmin=0,
+                    vmax=1,
+                    cmap="Greys",
+                )
+                axes[2].set_yticks(np.arange(pred_plot.shape[0]) + 0.5)
+                axes[2].set_yticklabels(y_labels)
+                axes[2].set_title("Frame-wise probabilities (heatmap)")
 
                 binary = binarize_with_activity_detection(frame_pred, class_columns, thresholds)
                 binary_data = binary[:, active_classes].T
-                axes[3].imshow(binary_data, aspect="auto", origin="lower", extent=[0, clip_len, 0, len(active_classes)])
-                axes[3].set_yticks(np.arange(len(active_classes)) + 0.5)
-                axes[3].set_yticklabels(active_names)
-                axes[3].set_title("Frame-wise predictions (VAD)")
+                binary_plot, _ = build_spacer_rows(binary_data, active_names)
+                im3 = axes[3].imshow(
+                    binary_plot,
+                    aspect="auto",
+                    origin="lower",
+                    extent=[0, clip_len, 0, binary_plot.shape[0]],
+                    vmin=0,
+                    vmax=1,
+                    cmap="Greys",
+                )
+                axes[3].set_yticks(np.arange(binary_plot.shape[0]) + 0.5)
+                axes[3].set_yticklabels(y_labels)
+                axes[3].set_title("Frame-wise detections (after activity_detection)")
                 axes[3].set_xlabel("Time (s)")
 
+                fig.colorbar(im3, ax=[axes[0], axes[2], axes[3]], location="right", fraction=0.02, pad=0.02)
                 fig.tight_layout()
                 audio_name = os.path.basename(sample["audio_path"]).replace(".wav", "")
                 fig_path = os.path.join(out_dir, f"{audio_name}_{prefix}_{class_name}.png")
