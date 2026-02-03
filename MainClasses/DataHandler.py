@@ -268,6 +268,7 @@ class DataHandler:
         for _, row in subset_meta.groupby(["site", "fname"]).first().iterrows():
             fname = row["fname"]
             site = row["site"]
+            file_labels = subset_meta[subset_meta["fname"] == fname][class_columns].max().values.astype(np.float32)
             audio_path = os.path.join(self.root, site, f"{fname}.wav")
             try:
                 s, _ = lrs.load(audio_path, sr=self.sr)
@@ -310,8 +311,7 @@ class DataHandler:
                         strong[start_frame:end_frame, class_idx] = 1.0
                 labels.append(strong)
             else:
-                weak = subset_meta[subset_meta["fname"] == fname][class_columns].max().values.astype(np.float32)
-                labels.append(weak)
+                labels.append(file_labels)
         return data, labels, audio_files
 
     def ann_to_labels_dcase17(self, ann_file, type):

@@ -298,16 +298,16 @@ def build_anuraset_segments(
     segments: List[AudioSegment] = []
     grouped = subset_meta.groupby(["site", "fname"])
     for (site, fname), group in grouped:
+        file_label = group[class_columns].max().values.astype(np.float32)
         audio_path = os.path.join(root_path, site, f"{fname}.wav")
         duration = 60
         if full_bag:
-            label = group[class_columns].max().values.astype(np.float32)
             segments.append(
                 AudioSegment(
                     audio_path=audio_path,
                     start_sec=0,
                     end_sec=duration,
-                    label=label,
+                    label=file_label,
                     segment_id=f"{fname}_full",
                     duration_sec=duration,
                 )
@@ -419,6 +419,25 @@ def split_segments(
     test_segments = segments[val_count:val_count + test_count]
     train_segments = segments[val_count + test_count:]
     return train_segments, val_segments, test_segments
+
+
+def select_target_segments(
+    segments: List[AudioSegment],
+    negative_split: float,
+    seed: int,
+    include_negatives: bool,
+) -> Tuple[List[AudioSegment], List[AudioSegment]]:
+    target_segments = [segment for segment in segments if np.any(segment.label)]
+    negative_segments = [segment for segment in segments if not np.any(segment.label)]
+    if include_negatives and negative_split > 0:
+        random.Random(seed).shuffle(negative_segments)
+        extra_count = int(len(negative_segments) * negative_split)
+        extra_segments = negative_segments[:extra_count]
+        remaining_negatives = negative_segments[extra_count:]
+    else:
+        extra_segments = []
+        remaining_negatives = negative_segments
+    return target_segments + extra_segments, remaining_negatives
 
 
 def compute_error_rate(y_true: np.ndarray, y_pred: np.ndarray, threshold: float) -> Tuple[float, float]:
@@ -949,6 +968,7 @@ if __name__ == "__main__":
     APPLY_TEST_SPLIT = config.APPLY_TEST_SPLIT
 
     TARGET_SPECIES = config.TARGET_SPECIES
+    INCLUDE_NEGATIVE_SPLITS = config.INCLUDE_NEGATIVE_SPLITS
     STRONG_LABELS_458 = config.STRONG_LABELS_458
     STRONG_LABELS_578 = config.STRONG_LABELS_578
     STRONG_LABEL_LEVELS = config.STRONG_LABEL_LEVELS
@@ -1031,22 +1051,39 @@ if __name__ == "__main__":
     )
 
     if APPLY_VALIDATION_SPLIT:
-        anura_train_segments, anura_val_segments, _ = split_segments(
-            anura_train_segments,
-            VALIDATION_SPLIT,
-            0.0,
-            seed=config.SEED,
-        )
+        if TARGET_SPECIES:
+            anura_val_segments, anura_train_negatives = select_target_segments(
+                anura_train_segments,
+                VALIDATION_SPLIT,
+                seed=config.SEED,
+                include_negatives=INCLUDE_NEGATIVE_SPLITS,
+            )
+            anura_train_segments = anura_train_negatives
+        else:
+            anura_train_segments, anura_val_segments, _ = split_segments(
+                anura_train_segments,
+                VALIDATION_SPLIT,
+                0.0,
+                seed=config.SEED,
+            )
     else:
         anura_val_segments = anura_train_segments
 
     if APPLY_TEST_SPLIT:
-        _, _, anura_test_segments = split_segments(
-            anura_test_segments,
-            0.0,
-            TEST_SPLIT,
-            seed=config.SEED,
-        )
+        if TARGET_SPECIES:
+            anura_test_segments, _ = select_target_segments(
+                anura_test_segments,
+                TEST_SPLIT,
+                seed=config.SEED,
+                include_negatives=INCLUDE_NEGATIVE_SPLITS,
+            )
+        else:
+            _, _, anura_test_segments = split_segments(
+                anura_test_segments,
+                0.0,
+                TEST_SPLIT,
+                seed=config.SEED,
+            )
 
     fnjv_id = "578" if "578" in FNJV_ROOT else "458"
     strong_labels_path = STRONG_LABELS_578 if fnjv_id == "578" else STRONG_LABELS_458
@@ -1256,6 +1293,7 @@ if __name__ == "__main__":
     print(">>> [config] APPLY_VALIDATION_SPLIT=", APPLY_VALIDATION_SPLIT)
     print(">>> [config] APPLY_TEST_SPLIT=", APPLY_TEST_SPLIT)
     print(">>> [config] TARGET_SPECIES=", TARGET_SPECIES)
+    print(">>> [config] INCLUDE_NEGATIVE_SPLITS=", INCLUDE_NEGATIVE_SPLITS)
     print(">>> [config] STRONG_LABEL_LEVELS=", STRONG_LABEL_LEVELS)
     print(">>> [config] ANURASET_EVAL=", ANURASET_EVAL)
     print(">>> [config] LOCALIZATION_MODE=", LOCALIZATION_MODE)
