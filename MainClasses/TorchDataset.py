@@ -77,5 +77,22 @@ class DCASE2019(Dataset):
             trans = parse_transform(self.transform)
             x_data = trans(torch.from_numpy(x_data))
         return x_data, y_data, x_file
+
+
+class AnuraSet(Dataset):
+    def __init__(self, options, type_, transform=None):
+        super(AnuraSet, self).__init__()
+        self.dh = DataHandler(dataset="AnuraSet")
+        self.x_data, self.y_data, self.audio_files = self.dh.load_anuraset(type_=type_)
+        self.type_ = type_
+
+    def __getitem__(self, item):
+        x_data = self.x_data[item]
+        y_data = self.y_data[item]
+        audio_file = self.audio_files[item]
+        return x_data, y_data, audio_file
+
+    def __len__(self):
+        return len(self.x_data)
     
     
