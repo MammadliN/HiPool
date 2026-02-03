@@ -18,6 +18,17 @@ class DataHandler:
     def __init__(self, dataset):
         self.dataset = dataset
         self.config = json.load(open('./MainClasses/config.json', 'r'))[self.dataset]
+        if self.dataset == "AnuraSet":
+            self.config["data"]["sr"] = mc.sample_rate
+            self.config["data"]["sample_width"] = mc.n_fft
+            self.config["data"]["sample_step"] = mc.hop_length
+            self.config["data"]["n_mels"] = mc.n_mels
+            if mc.BAG_SECONDS == "full":
+                self.config["data"]["clip_len"] = 60
+            else:
+                self.config["data"]["clip_len"] = mc.BAG_SECONDS
+            self.config["data"]["labels"] = mc.TARGET_SPECIES or self.config["data"]["labels"]
+            self.config["eval"].update(mc.ANURASET_EVAL)
         self.root = self.config['data']['root']
         self.sr = self.config['data']['sr']
         self.frame_width = self.config['data']['sample_width']
