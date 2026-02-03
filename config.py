@@ -66,3 +66,9 @@ ANURASET_EVAL = {
     "loc_threshold_low": 0.1,
     "smooth": 10,
 }
+
+# LOCALIZATION_MODE can be "frame" (current behavior) or "block" (aggregate frames).
+LOCALIZATION_MODE = "frame"
+
+# BLOCK_SECONDS is used only when LOCALIZATION_MODE == "block".
+BLOCK_SECONDS = 1.0

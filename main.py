@@ -518,6 +518,47 @@ def localization_frame_labels(
     return labels
 
 
+def blockify_frames(
+    frame_scores: np.ndarray,
+    block_frames: int,
+    pool_style: str,
+) -> np.ndarray:
+    if block_frames <= 1:
+        return frame_scores
+    total_frames = frame_scores.shape[0]
+    block_count = total_frames // block_frames
+    if block_count == 0:
+        return frame_scores
+    trimmed = frame_scores[: block_count * block_frames]
+    blocks = trimmed.reshape(block_count, block_frames, frame_scores.shape[1])
+    if pool_style == "max_pool":
+        return blocks.max(axis=1)
+    if pool_style == "avg_pool":
+        return blocks.mean(axis=1)
+    if pool_style == "linear_pool":
+        numerator = (blocks ** 2).sum(axis=1)
+        denominator = blocks.sum(axis=1) + 1e-8
+        return numerator / denominator
+    if pool_style == "exp_pool":
+        exp_blocks = np.exp(blocks)
+        numerator = (blocks * exp_blocks).sum(axis=1)
+        denominator = exp_blocks.sum(axis=1) + 1e-8
+        return numerator / denominator
+    return blocks.mean(axis=1)
+
+
+def blockify_binary_labels(frame_labels: np.ndarray, block_frames: int) -> np.ndarray:
+    if block_frames <= 1:
+        return frame_labels
+    total_frames = frame_labels.shape[0]
+    block_count = total_frames // block_frames
+    if block_count == 0:
+        return frame_labels
+    trimmed = frame_labels[: block_count * block_frames]
+    blocks = trimmed.reshape(block_count, block_frames, frame_labels.shape[1])
+    return blocks.max(axis=1)
+
+
 def evaluate_localization(
     model: nn.Module,
     loader: DataLoader,
@@ -525,6 +566,10 @@ def evaluate_localization(
     class_columns: List[str],
     threshold: float,
     device: torch.device,
+    localization_mode: str,
+    block_seconds: float,
+    frame_duration: float,
+    pool_style: str,
 ) -> Tuple[Dict[str, float], np.ndarray]:
     model.eval()
     preds = []
@@ -556,6 +601,10 @@ def evaluate_localization(
                     float(ends[i]),
                     frames_len,
                 )
+                if localization_mode == "block":
+                    block_frames = max(1, int(round(block_seconds / frame_duration)))
+                    frame_pred = blockify_frames(frame_pred, block_frames, pool_style)
+                    frame_true = blockify_binary_labels(frame_true, block_frames)
                 preds.append(frame_pred)
                 targets.append(frame_true)
     if not preds:
@@ -606,6 +655,10 @@ def visualize_predictions(
     output_root: str,
     prefix: str,
     max_per_class: int = 5,
+    localization_mode: str = "frame",
+    block_seconds: float = 1.0,
+    frame_duration: float = 0.05,
+    pool_style: str = "avg_pool",
 ) -> None:
     model.eval()
     selections = {name: {"correct": [], "wrong": []} for name in class_columns}
@@ -637,6 +690,10 @@ def visualize_predictions(
                     float(ends[i]),
                     frame_pred.shape[0],
                 )
+                if localization_mode == "block":
+                    block_frames = max(1, int(round(block_seconds / frame_duration)))
+                    frame_pred = blockify_frames(frame_pred, block_frames, pool_style)
+                    frame_true = blockify_binary_labels(frame_true, block_frames)
                 for class_idx, class_name in enumerate(class_columns):
                     if len(selections[class_name]["correct"]) >= max_per_class and len(
                         selections[class_name]["wrong"]
@@ -850,6 +907,8 @@ if __name__ == "__main__":
     STRONG_LABELS_578 = config.STRONG_LABELS_578
     STRONG_LABEL_LEVELS = config.STRONG_LABEL_LEVELS
     ANURASET_EVAL = config.ANURASET_EVAL
+    LOCALIZATION_MODE = config.LOCALIZATION_MODE
+    BLOCK_SECONDS = config.BLOCK_SECONDS
 
     pool_map = {
         "max": "max_pool",
@@ -1153,6 +1212,8 @@ if __name__ == "__main__":
     print(">>> [config] TARGET_SPECIES=", TARGET_SPECIES)
     print(">>> [config] STRONG_LABEL_LEVELS=", STRONG_LABEL_LEVELS)
     print(">>> [config] ANURASET_EVAL=", ANURASET_EVAL)
+    print(">>> [config] LOCALIZATION_MODE=", LOCALIZATION_MODE)
+    print(">>> [config] BLOCK_SECONDS=", BLOCK_SECONDS)
     print(">>> [config] sample_rate=", sample_rate)
     print(">>> [config] n_mels=", n_mels)
     print(">>> [config] n_fft=", n_fft)
@@ -1278,6 +1339,7 @@ if __name__ == "__main__":
         print(f"  {class_name}: {f1_value:.4f}")
 
     if strong_events is not None and DATASET_TEST == "AnuraSet":
+        frame_duration = hop_length / sample_rate
         loc_metrics_macro, loc_class_f1_macro = evaluate_localization(
             best_macro_model,
             test_loader,
@@ -1285,6 +1347,10 @@ if __name__ == "__main__":
             class_columns,
             threshold,
             device,
+            LOCALIZATION_MODE,
+            BLOCK_SECONDS,
+            frame_duration,
+            pool_style,
         )
         print("Macro Model Localization Metrics")
         print(loc_metrics_macro)
@@ -1299,6 +1365,10 @@ if __name__ == "__main__":
             class_columns,
             threshold,
             device,
+            LOCALIZATION_MODE,
+            BLOCK_SECONDS,
+            frame_duration,
+            pool_style,
         )
         print("Micro Model Localization Metrics")
         print(loc_metrics_micro)
@@ -1314,6 +1384,10 @@ if __name__ == "__main__":
             ANURASET_EVAL,
             output_root="results/AnuraSet/viz",
             prefix="macro",
+            localization_mode=LOCALIZATION_MODE,
+            block_seconds=BLOCK_SECONDS,
+            frame_duration=frame_duration,
+            pool_style=pool_style,
         )
         visualize_predictions(
             best_micro_model,
@@ -1323,4 +1397,8 @@ if __name__ == "__main__":
             ANURASET_EVAL,
             output_root="results/AnuraSet/viz",
             prefix="micro",
+            localization_mode=LOCALIZATION_MODE,
+            block_seconds=BLOCK_SECONDS,
+            frame_duration=frame_duration,
+            pool_style=pool_style,
         )
