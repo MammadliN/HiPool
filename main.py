@@ -524,13 +524,25 @@ def apply_tagging_thresholds(
     clip_out: np.ndarray,
     thresholds: Dict[str, np.ndarray],
     system: str,
+    per_class_systems: Optional[List[str]] = None,
 ) -> np.ndarray:
-    if system == "single":
-        return (clip_out >= thresholds["tag_threshold"]).astype(np.float32)
-    low = thresholds["tag_threshold_low"]
-    high = thresholds["tag_threshold_high"]
-    mid = (low + high) / 2.0
-    return (clip_out >= mid).astype(np.float32)
+    if per_class_systems is None:
+        if system == "single":
+            return (clip_out >= thresholds["tag_threshold"]).astype(np.float32)
+        low = thresholds["tag_threshold_low"]
+        high = thresholds["tag_threshold_high"]
+        mid = (low + high) / 2.0
+        return (clip_out >= mid).astype(np.float32)
+    y_hat = np.zeros_like(clip_out, dtype=np.float32)
+    for k, mode in enumerate(per_class_systems):
+        if mode == "double":
+            low = thresholds["tag_threshold_low"][k]
+            high = thresholds["tag_threshold_high"][k]
+            mid = (low + high) / 2.0
+            y_hat[:, k] = (clip_out[:, k] >= mid).astype(np.float32)
+        else:
+            y_hat[:, k] = (clip_out[:, k] >= thresholds["tag_threshold"][k]).astype(np.float32)
+    return y_hat
 
 
 def apply_localization_thresholds(
@@ -538,24 +550,45 @@ def apply_localization_thresholds(
     class_columns: List[str],
     thresholds: Dict[str, np.ndarray],
     system: str,
+    per_class_systems: Optional[List[str]] = None,
 ) -> np.ndarray:
-    if system == "single":
-        return (frame_out >= thresholds["loc_threshold"]).astype(np.float32)
+    if per_class_systems is None:
+        if system == "single":
+            return (frame_out >= thresholds["loc_threshold"]).astype(np.float32)
+        n_frames, n_classes = frame_out.shape
+        binary = np.zeros((n_frames, n_classes), dtype=np.float32)
+        for k in range(n_classes):
+            pairs = activity_detection(
+                x=frame_out[:, k],
+                thres=float(thresholds["loc_threshold_high"][k]),
+                low_thres=float(thresholds["loc_threshold_low"][k]),
+                n_smooth=thresholds["smooth"],
+                n_salt=thresholds["smooth"],
+            )
+            for onset, offset in pairs:
+                onset = max(0, min(n_frames, int(onset)))
+                offset = max(0, min(n_frames, int(offset)))
+                if offset > onset:
+                    binary[onset:offset, k] = 1.0
+        return binary
     n_frames, n_classes = frame_out.shape
     binary = np.zeros((n_frames, n_classes), dtype=np.float32)
     for k in range(n_classes):
-        pairs = activity_detection(
-            x=frame_out[:, k],
-            thres=float(thresholds["loc_threshold_high"][k]),
-            low_thres=float(thresholds["loc_threshold_low"][k]),
-            n_smooth=thresholds["smooth"],
-            n_salt=thresholds["smooth"],
-        )
-        for onset, offset in pairs:
-            onset = max(0, min(n_frames, int(onset)))
-            offset = max(0, min(n_frames, int(offset)))
-            if offset > onset:
-                binary[onset:offset, k] = 1.0
+        if per_class_systems[k] == "double":
+            pairs = activity_detection(
+                x=frame_out[:, k],
+                thres=float(thresholds["loc_threshold_high"][k]),
+                low_thres=float(thresholds["loc_threshold_low"][k]),
+                n_smooth=thresholds["smooth"],
+                n_salt=thresholds["smooth"],
+            )
+            for onset, offset in pairs:
+                onset = max(0, min(n_frames, int(onset)))
+                offset = max(0, min(n_frames, int(offset)))
+                if offset > onset:
+                    binary[onset:offset, k] = 1.0
+        else:
+            binary[:, k] = (frame_out[:, k] >= thresholds["loc_threshold"][k]).astype(np.float32)
     return binary
 
 
@@ -847,24 +880,45 @@ def binarize_with_activity_detection(
     class_columns: List[str],
     thresholds: Dict[str, np.ndarray],
     system: str,
+    per_class_systems: Optional[List[str]] = None,
 ) -> np.ndarray:
-    if system == "single":
-        return (frame_pred >= thresholds["loc_threshold"]).astype(np.float32)
+    if per_class_systems is None:
+        if system == "single":
+            return (frame_pred >= thresholds["loc_threshold"]).astype(np.float32)
+        n_frames, n_classes = frame_pred.shape
+        binary = np.zeros((n_frames, n_classes), dtype=np.float32)
+        for k in range(n_classes):
+            pairs = activity_detection(
+                x=frame_pred[:, k],
+                thres=float(thresholds["loc_threshold_high"][k]),
+                low_thres=float(thresholds["loc_threshold_low"][k]),
+                n_smooth=thresholds["smooth"],
+                n_salt=thresholds["smooth"],
+            )
+            for onset, offset in pairs:
+                onset = max(0, min(n_frames, int(onset)))
+                offset = max(0, min(n_frames, int(offset)))
+                if offset > onset:
+                    binary[onset:offset, k] = 1.0
+        return binary
     n_frames, n_classes = frame_pred.shape
     binary = np.zeros((n_frames, n_classes), dtype=np.float32)
     for k in range(n_classes):
-        pairs = activity_detection(
-            x=frame_pred[:, k],
-            thres=float(thresholds["loc_threshold_high"][k]),
-            low_thres=float(thresholds["loc_threshold_low"][k]),
-            n_smooth=thresholds["smooth"],
-            n_salt=thresholds["smooth"],
-        )
-        for onset, offset in pairs:
-            onset = max(0, min(n_frames, int(onset)))
-            offset = max(0, min(n_frames, int(offset)))
-            if offset > onset:
-                binary[onset:offset, k] = 1.0
+        if per_class_systems[k] == "double":
+            pairs = activity_detection(
+                x=frame_pred[:, k],
+                thres=float(thresholds["loc_threshold_high"][k]),
+                low_thres=float(thresholds["loc_threshold_low"][k]),
+                n_smooth=thresholds["smooth"],
+                n_salt=thresholds["smooth"],
+            )
+            for onset, offset in pairs:
+                onset = max(0, min(n_frames, int(onset)))
+                offset = max(0, min(n_frames, int(offset)))
+                if offset > onset:
+                    binary[onset:offset, k] = 1.0
+        else:
+            binary[:, k] = (frame_pred[:, k] >= thresholds["loc_threshold"][k]).astype(np.float32)
     return binary
 
 
@@ -883,6 +937,8 @@ def visualize_predictions(
     pool_style: str = "avg_pool",
     tagging_system: str = "single",
     localization_system: str = "single",
+    per_class_tagging_systems: Optional[List[str]] = None,
+    per_class_localization_systems: Optional[List[str]] = None,
 ) -> None:
     model.eval()
     selections = {name: {"correct": [], "wrong": []} for name in class_columns}
@@ -899,7 +955,12 @@ def visualize_predictions(
             frame_out = frame_out.cpu().numpy()
             mask_np = mask.cpu().numpy() if mask is not None else None
             y_true = y_data.cpu().numpy()
-            tag_preds = apply_tagging_thresholds(clip_out, thresholds, tagging_system)
+            tag_preds = apply_tagging_thresholds(
+                clip_out,
+                thresholds,
+                tagging_system,
+                per_class_systems=per_class_tagging_systems,
+            )
             for i in range(len(paths)):
                 file_stem = anuraset_file_stem(paths[i])
                 events = strong_events.get(file_stem, [])
@@ -976,11 +1037,14 @@ def visualize_predictions(
                         layout[row_idx] = labels[idx]
                     return out, layout
 
-                fig, axes = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
-                fig.suptitle(
-                    f"Tagging={tagging_system} | Localization={localization_system}",
-                    fontsize=12,
-                )
+                fig, axes = plt.subplots(4, 1, figsize=(12, 12), sharex=True, constrained_layout=True)
+                tag_label = tagging_system
+                loc_label = localization_system
+                if per_class_tagging_systems is not None:
+                    tag_label = per_class_tagging_systems[sample["class_idx"]]
+                if per_class_localization_systems is not None:
+                    loc_label = per_class_localization_systems[sample["class_idx"]]
+                fig.suptitle(f"Tagging={tag_label} | Localization={loc_label}", fontsize=12)
                 gt_data = frame_true[:, active_classes].T
                 gt_plot, y_labels = build_spacer_rows(gt_data, active_names)
                 im0 = axes[0].imshow(
@@ -999,7 +1063,10 @@ def visualize_predictions(
                 for idx in active_classes:
                     axes[1].plot(t_sec, frame_pred[:, idx], label=class_columns[idx])
                 class_idx = sample["class_idx"]
-                if localization_system == "single":
+                active_loc_system = localization_system
+                if per_class_localization_systems is not None:
+                    active_loc_system = per_class_localization_systems[class_idx]
+                if active_loc_system == "single":
                     loc_value = float(thresholds["loc_threshold"][class_idx])
                     axes[1].axhline(loc_value, color="red", linestyle="--", linewidth=1)
                 else:
@@ -1035,7 +1102,11 @@ def visualize_predictions(
                 axes[2].set_title("Frame-wise probabilities (heatmap)")
 
                 binary = binarize_with_activity_detection(
-                    frame_pred, class_columns, thresholds, localization_system
+                    frame_pred,
+                    class_columns,
+                    thresholds,
+                    localization_system,
+                    per_class_systems=per_class_localization_systems,
                 )
                 binary_data = binary[:, active_classes].T
                 binary_plot, _ = build_spacer_rows(binary_data, active_names)
@@ -1051,13 +1122,12 @@ def visualize_predictions(
                 axes[3].set_yticks(np.arange(binary_plot.shape[0]) + 0.5)
                 axes[3].set_yticklabels(y_labels)
                 axes[3].set_title(
-                    "Frame-wise detections (after activity_detection)" if localization_system == "double"
+                    "Frame-wise detections (after activity_detection)" if active_loc_system == "double"
                     else "Frame-wise detections (single threshold)"
                 )
                 axes[3].set_xlabel("Time (s)")
 
                 fig.colorbar(im3, ax=[axes[0], axes[2], axes[3]], location="right", fraction=0.02, pad=0.02)
-                fig.tight_layout()
                 audio_name = os.path.basename(sample["audio_path"]).replace(".wav", "")
                 fig_path = os.path.join(out_dir, f"{audio_name}_{prefix}_{class_name}.png")
                 fig.savefig(fig_path)
@@ -1120,6 +1190,50 @@ def evaluate_localization_cached(
     return float(np.mean(class_f1)) if class_f1.size else 0.0, class_f1
 
 
+def compute_metrics_binary(y_true: np.ndarray, y_hat: np.ndarray) -> Dict[str, float]:
+    tp = (y_hat * y_true).sum(axis=0)
+    fp = (y_hat * (1 - y_true)).sum(axis=0)
+    fn = ((1 - y_hat) * y_true).sum(axis=0)
+    precision_per = tp / (tp + fp + 1e-10)
+    recall_per = tp / (tp + fn + 1e-10)
+    f1_per = 2 * precision_per * recall_per / (precision_per + recall_per + 1e-10)
+    macro_precision = float(np.mean(precision_per)) if precision_per.size else 0.0
+    macro_recall = float(np.mean(recall_per)) if recall_per.size else 0.0
+    macro_f1 = float(np.mean(f1_per)) if f1_per.size else 0.0
+
+    total_tp = tp.sum()
+    total_fp = fp.sum()
+    total_fn = fn.sum()
+    micro_precision = float(total_tp / (total_tp + total_fp + 1e-10))
+    micro_recall = float(total_tp / (total_tp + total_fn + 1e-10))
+    micro_f1 = float(2 * micro_precision * micro_recall / (micro_precision + micro_recall + 1e-10))
+
+    s = min(total_tp + total_fn, total_tp + total_fp) - total_tp
+    d = max(0.0, total_fn - total_fp)
+    i = max(0.0, total_fp - total_fn)
+    micro_er = float((s + d + i) / (total_tp + total_fn + 1e-10))
+
+    macro_er_list = []
+    for k in range(y_true.shape[1]):
+        s = min(tp[k] + fn[k], tp[k] + fp[k]) - tp[k]
+        d = max(0.0, fn[k] - fp[k])
+        i = max(0.0, fp[k] - fn[k])
+        er = (s + d + i) / (tp[k] + fn[k] + 1e-10)
+        macro_er_list.append(er)
+    macro_er = float(np.mean(macro_er_list)) if macro_er_list else 0.0
+
+    return {
+        "micro_precision": micro_precision,
+        "micro_recall": micro_recall,
+        "micro_f1": micro_f1,
+        "macro_precision": macro_precision,
+        "macro_recall": macro_recall,
+        "macro_f1": macro_f1,
+        "micro_er": micro_er,
+        "macro_er": macro_er,
+    }
+
+
 def print_threshold_table(
     title: str,
     thresholds: Dict[str, np.ndarray],
@@ -1139,6 +1253,33 @@ def print_threshold_table(
             class_columns, thresholds[low_key], thresholds[high_key]
         ):
             print(f"  {class_name}: low={float(low_value):.3f}, high={float(high_value):.3f}")
+
+
+def print_eval_block(
+    title: str,
+    metrics: Dict[str, float],
+    class_columns: List[str],
+    thresholds: Dict[str, np.ndarray],
+    class_f1: np.ndarray,
+    system: str,
+    objective: str,
+) -> None:
+    print(title)
+    print(metrics)
+    if system == "single":
+        key = "tag_threshold" if objective == "tagging" else "loc_threshold"
+        for class_name, th_value, f1_value in zip(class_columns, thresholds[key], class_f1):
+            print(f"{class_name}: th={float(th_value):.3f} - f1={float(f1_value):.2f}")
+    else:
+        low_key = "tag_threshold_low" if objective == "tagging" else "loc_threshold_low"
+        high_key = "tag_threshold_high" if objective == "tagging" else "loc_threshold_high"
+        for class_name, low_value, high_value, f1_value in zip(
+            class_columns, thresholds[low_key], thresholds[high_key], class_f1
+        ):
+            print(
+                f"{class_name}: low={float(low_value):.3f}, high={float(high_value):.3f} - "
+                f"f1={float(f1_value):.2f}"
+            )
 
 
 def plot_training_history(history: Dict[str, List[float]], output_path: str) -> None:
@@ -1760,8 +1901,30 @@ if __name__ == "__main__":
             tag_double_f1, _ = evaluate_tagging_cached(
                 test_cache["clip_true"], test_cache["clip_out"], tag_double, system="double"
             )
-            print(f"{name} Tagging - single threshold macro F1: {tag_single_f1:.4f}")
-            print(f"{name} Tagging - double threshold macro F1: {tag_double_f1:.4f}")
+            tag_single_hat = apply_tagging_thresholds(test_cache["clip_out"], tag_single, "single")
+            tag_double_hat = apply_tagging_thresholds(test_cache["clip_out"], tag_double, "double")
+            tag_single_metrics = compute_metrics_binary(test_cache["clip_true"], tag_single_hat)
+            tag_double_metrics = compute_metrics_binary(test_cache["clip_true"], tag_double_hat)
+            tag_single_class_f1 = compute_class_f1_binary(test_cache["clip_true"], tag_single_hat)
+            tag_double_class_f1 = compute_class_f1_binary(test_cache["clip_true"], tag_double_hat)
+            print_eval_block(
+                f"{name} Tagging (single)",
+                tag_single_metrics,
+                class_columns,
+                tag_single,
+                tag_single_class_f1,
+                system="single",
+                objective="tagging",
+            )
+            print_eval_block(
+                f"{name} Tagging (double)",
+                tag_double_metrics,
+                class_columns,
+                tag_double,
+                tag_double_class_f1,
+                system="double",
+                objective="tagging",
+            )
 
             loc_single_f1 = 0.0
             loc_double_f1 = 0.0
@@ -1769,6 +1932,8 @@ if __name__ == "__main__":
             loc_double = {}
             loc_single_score = 0.0
             loc_double_score = 0.0
+            loc_single_class_f1 = np.zeros(len(class_columns), dtype=np.float32)
+            loc_double_class_f1 = np.zeros(len(class_columns), dtype=np.float32)
             if val_cache["frame_true"].size and test_cache["frame_true"].size:
                 print(f"{name} Localization Threshold Tuning (single)")
                 loc_single, loc_single_score = iterative_threshold_optimization(
@@ -1826,11 +1991,45 @@ if __name__ == "__main__":
                     loc_double,
                     system="double",
                 )
-                print(f"{name} Localization - single threshold macro F1: {loc_single_f1:.4f}")
-                print(f"{name} Localization - double threshold macro F1: {loc_double_f1:.4f}")
+                loc_single_hat = apply_localization_thresholds(
+                    test_cache["frame_out"], class_columns, loc_single, "single"
+                )
+                loc_double_hat = apply_localization_thresholds(
+                    test_cache["frame_out"], class_columns, loc_double, "double"
+                )
+                loc_single_metrics = compute_metrics_binary(test_cache["frame_true"], loc_single_hat)
+                loc_double_metrics = compute_metrics_binary(test_cache["frame_true"], loc_double_hat)
+                loc_single_class_f1 = compute_class_f1_binary(test_cache["frame_true"], loc_single_hat)
+                loc_double_class_f1 = compute_class_f1_binary(test_cache["frame_true"], loc_double_hat)
+                print_eval_block(
+                    f"{name} Localization (single)",
+                    loc_single_metrics,
+                    class_columns,
+                    loc_single,
+                    loc_single_class_f1,
+                    system="single",
+                    objective="localization",
+                )
+                print_eval_block(
+                    f"{name} Localization (double)",
+                    loc_double_metrics,
+                    class_columns,
+                    loc_double,
+                    loc_double_class_f1,
+                    system="double",
+                    objective="localization",
+                )
 
             tag_system = "single" if tag_single_score >= tag_double_score else "double"
             loc_system = "single" if loc_single_score >= loc_double_score else "double"
+            per_class_tagging = [
+                "double" if tag_double_class_f1[i] > tag_single_class_f1[i] else "single"
+                for i in range(len(class_columns))
+            ]
+            per_class_loc = [
+                "double" if loc_double_class_f1[i] > loc_single_class_f1[i] else "single"
+                for i in range(len(class_columns))
+            ]
             combined_thresholds = {
                 "tag_threshold": tag_single.get("tag_threshold", base_thresholds["tag_threshold"]),
                 "tag_threshold_low": tag_double.get("tag_threshold_low", base_thresholds["tag_threshold_low"]),
@@ -1856,6 +2055,8 @@ if __name__ == "__main__":
                     pool_style=pool_style,
                     tagging_system=tag_system,
                     localization_system=loc_system,
+                    per_class_tagging_systems=per_class_tagging,
+                    per_class_localization_systems=per_class_loc,
                 )
 
         run_tuning_for_model(best_macro_model, "Best Macro Model")
