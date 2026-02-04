@@ -43,8 +43,11 @@ APPLY_TEST_SPLIT = True
 # When True, add a proportion of non-target recordings to validation/test splits.
 INCLUDE_NEGATIVE_SPLITS = True
 
+# Toggle class-specific threshold tuning during evaluation/visualization only.
+USE_CLASS_SPECIFIC_THRESHOLD_TUNING = True
+
 # TARGET_SPECIES = ["DENMIN", "LEPLAT", "PHYCUV", "SPHSUR", "SCIPER", "BOABIS", "BOAFAB", "LEPPOD", "PHYALB"]
-TARGET_SPECIES = ["DENMIN", "BOARAN", "DENNAN", "LEPFUS", "SCIFUS"]
+TARGET_SPECIES = ["DENMIN", "BOARAN", "DENNAN", "LEPFUS"]
 
 sample_rate = 22000
 n_mels = 64

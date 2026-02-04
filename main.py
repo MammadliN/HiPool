@@ -508,6 +508,206 @@ def compute_class_f1(y_true: np.ndarray, y_pred: np.ndarray, threshold: float) -
     return f1
 
 
+def compute_class_f1_binary(y_true: np.ndarray, y_hat: np.ndarray) -> np.ndarray:
+    tp = (y_hat * y_true).sum(axis=0)
+    fp = (y_hat * (1 - y_true)).sum(axis=0)
+    fn = ((1 - y_hat) * y_true).sum(axis=0)
+    return 2 * tp / (2 * tp + fp + fn + 1e-10)
+
+
+def compute_macro_f1_binary(y_true: np.ndarray, y_hat: np.ndarray) -> float:
+    class_f1 = compute_class_f1_binary(y_true, y_hat)
+    return float(np.mean(class_f1)) if class_f1.size else 0.0
+
+
+def apply_tagging_thresholds(
+    clip_out: np.ndarray,
+    thresholds: Dict[str, np.ndarray],
+    system: str,
+) -> np.ndarray:
+    if system == "single":
+        return (clip_out >= thresholds["tag_threshold"]).astype(np.float32)
+    low = thresholds["tag_threshold_low"]
+    high = thresholds["tag_threshold_high"]
+    mid = (low + high) / 2.0
+    return (clip_out >= mid).astype(np.float32)
+
+
+def apply_localization_thresholds(
+    frame_out: np.ndarray,
+    class_columns: List[str],
+    thresholds: Dict[str, np.ndarray],
+    system: str,
+) -> np.ndarray:
+    if system == "single":
+        return (frame_out >= thresholds["loc_threshold"]).astype(np.float32)
+    n_frames, n_classes = frame_out.shape
+    binary = np.zeros((n_frames, n_classes), dtype=np.float32)
+    for k in range(n_classes):
+        pairs = activity_detection(
+            x=frame_out[:, k],
+            thres=float(thresholds["loc_threshold_high"][k]),
+            low_thres=float(thresholds["loc_threshold_low"][k]),
+            n_smooth=thresholds["smooth"],
+            n_salt=thresholds["smooth"],
+        )
+        for onset, offset in pairs:
+            onset = max(0, min(n_frames, int(onset)))
+            offset = max(0, min(n_frames, int(offset)))
+            if offset > onset:
+                binary[onset:offset, k] = 1.0
+    return binary
+
+
+def cache_model_outputs(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    strong_events: Optional[Dict[str, List[Dict[str, object]]]],
+    class_columns: List[str],
+    localization_mode: str,
+    block_seconds: float,
+    frame_duration: float,
+    pool_style: str,
+) -> Dict[str, np.ndarray]:
+    model.eval()
+    clip_preds = []
+    clip_targets = []
+    frame_preds = []
+    frame_targets = []
+    with torch.no_grad():
+        for x_data, y_data, _ids, mask, paths, starts, ends in loader:
+            x_data = x_data.to(device)
+            if mask is not None:
+                mask = mask.to(device)
+                clip_out, frame_out = model(x_data, mask=mask)
+            else:
+                clip_out, frame_out = model(x_data)
+            clip_out_np = clip_out.cpu().numpy()
+            frame_out_np = frame_out.cpu().numpy()
+            mask_np = mask.cpu().numpy() if mask is not None else None
+            clip_preds.append(clip_out_np)
+            clip_targets.append(y_data.cpu().numpy())
+            if strong_events is None:
+                continue
+            for i in range(len(paths)):
+                file_stem = anuraset_file_stem(paths[i])
+                events = strong_events.get(file_stem, [])
+                frames_len = frame_out_np[i].shape[0]
+                if mask_np is not None:
+                    frames_len = int(mask_np[i].sum())
+                    frames_len = max(frames_len, 1)
+                    frame_pred = frame_out_np[i][:frames_len]
+                else:
+                    frame_pred = frame_out_np[i]
+                frame_true = localization_frame_labels(
+                    events,
+                    class_columns,
+                    float(starts[i]),
+                    float(ends[i]),
+                    frames_len,
+                )
+                if localization_mode == "block":
+                    block_frames = max(1, int(round(block_seconds / frame_duration)))
+                    frame_pred = blockify_frames(frame_pred, block_frames, pool_style)
+                    frame_true = blockify_binary_labels(frame_true, block_frames)
+                frame_preds.append(frame_pred)
+                frame_targets.append(frame_true)
+    clip_out_all = np.concatenate(clip_preds, axis=0) if clip_preds else np.zeros((0, 0))
+    clip_true_all = np.concatenate(clip_targets, axis=0) if clip_targets else np.zeros((0, 0))
+    frame_out_all = np.concatenate(frame_preds, axis=0) if frame_preds else np.zeros((0, 0))
+    frame_true_all = np.concatenate(frame_targets, axis=0) if frame_targets else np.zeros((0, 0))
+    return {
+        "clip_out": clip_out_all,
+        "clip_true": clip_true_all,
+        "frame_out": frame_out_all,
+        "frame_true": frame_true_all,
+    }
+
+
+def iterative_threshold_optimization(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    thresholds: Dict[str, np.ndarray],
+    system: str,
+    step: float,
+    max_rounds: int,
+    objective: str,
+    class_columns: Optional[List[str]] = None,
+) -> Tuple[Dict[str, np.ndarray], float]:
+    best_thresholds = {k: np.array(v, copy=True) for k, v in thresholds.items()}
+    if objective == "tagging":
+        y_hat = apply_tagging_thresholds(y_pred, best_thresholds, system)
+    else:
+        y_hat = apply_localization_thresholds(y_pred, class_columns or [], best_thresholds, system)
+    best_score = compute_macro_f1_binary(y_true, y_hat)
+
+    improved = True
+    rounds = 0
+    while improved and rounds < max_rounds:
+        improved = False
+        rounds += 1
+        for idx in range(y_true.shape[1]):
+            if system == "single":
+                key = "tag_threshold" if objective == "tagging" else "loc_threshold"
+                current = best_thresholds[key][idx]
+                for delta in (-step, step):
+                    value = float(np.clip(current + delta, 0.0, 1.0))
+                    candidate_thresholds = {k: np.array(v, copy=True) for k, v in best_thresholds.items()}
+                    candidate_thresholds[key][idx] = value
+                    if objective == "tagging":
+                        y_hat = apply_tagging_thresholds(y_pred, candidate_thresholds, system)
+                    else:
+                        y_hat = apply_localization_thresholds(y_pred, class_columns or [], candidate_thresholds, system)
+                    score = compute_macro_f1_binary(y_true, y_hat)
+                    if score > best_score:
+                        best_score = score
+                        best_thresholds = candidate_thresholds
+                        improved = True
+                        current = value
+            else:
+                low_key = "tag_threshold_low" if objective == "tagging" else "loc_threshold_low"
+                high_key = "tag_threshold_high" if objective == "tagging" else "loc_threshold_high"
+                low_current = best_thresholds[low_key][idx]
+                high_current = best_thresholds[high_key][idx]
+                for delta in (-step, step):
+                    low_value = float(np.clip(low_current + delta, 0.0, 1.0))
+                    if low_value <= high_current:
+                        candidate_thresholds = {k: np.array(v, copy=True) for k, v in best_thresholds.items()}
+                        candidate_thresholds[low_key][idx] = low_value
+                        candidate_thresholds[high_key][idx] = high_current
+                        if objective == "tagging":
+                            y_hat = apply_tagging_thresholds(y_pred, candidate_thresholds, system)
+                        else:
+                            y_hat = apply_localization_thresholds(
+                                y_pred, class_columns or [], candidate_thresholds, system
+                            )
+                        score = compute_macro_f1_binary(y_true, y_hat)
+                        if score > best_score:
+                            best_score = score
+                            best_thresholds = candidate_thresholds
+                            improved = True
+                            low_current = low_value
+                    high_value = float(np.clip(high_current + delta, 0.0, 1.0))
+                    if low_current <= high_value:
+                        candidate_thresholds = {k: np.array(v, copy=True) for k, v in best_thresholds.items()}
+                        candidate_thresholds[low_key][idx] = low_current
+                        candidate_thresholds[high_key][idx] = high_value
+                        if objective == "tagging":
+                            y_hat = apply_tagging_thresholds(y_pred, candidate_thresholds, system)
+                        else:
+                            y_hat = apply_localization_thresholds(
+                                y_pred, class_columns or [], candidate_thresholds, system
+                            )
+                        score = compute_macro_f1_binary(y_true, y_hat)
+                        if score > best_score:
+                            best_score = score
+                            best_thresholds = candidate_thresholds
+                            improved = True
+                            high_current = high_value
+    return best_thresholds, best_score
+
+
 def localization_frame_labels(
     events: List[Dict[str, object]],
     class_columns: List[str],
@@ -645,15 +845,18 @@ def evaluate_localization(
 def binarize_with_activity_detection(
     frame_pred: np.ndarray,
     class_columns: List[str],
-    thresholds: Dict[str, float],
+    thresholds: Dict[str, np.ndarray],
+    system: str,
 ) -> np.ndarray:
+    if system == "single":
+        return (frame_pred >= thresholds["loc_threshold"]).astype(np.float32)
     n_frames, n_classes = frame_pred.shape
     binary = np.zeros((n_frames, n_classes), dtype=np.float32)
     for k in range(n_classes):
         pairs = activity_detection(
             x=frame_pred[:, k],
-            thres=thresholds["loc_threshold_high"],
-            low_thres=thresholds["loc_threshold_low"],
+            thres=float(thresholds["loc_threshold_high"][k]),
+            low_thres=float(thresholds["loc_threshold_low"][k]),
             n_smooth=thresholds["smooth"],
             n_salt=thresholds["smooth"],
         )
@@ -670,7 +873,7 @@ def visualize_predictions(
     loader: DataLoader,
     strong_events: Dict[str, List[Dict[str, object]]],
     class_columns: List[str],
-    thresholds: Dict[str, float],
+    thresholds: Dict[str, np.ndarray],
     output_root: str,
     prefix: str,
     max_per_class: int = 5,
@@ -678,6 +881,8 @@ def visualize_predictions(
     block_seconds: float = 1.0,
     frame_duration: float = 0.05,
     pool_style: str = "avg_pool",
+    tagging_system: str = "single",
+    localization_system: str = "single",
 ) -> None:
     model.eval()
     selections = {name: {"correct": [], "wrong": []} for name in class_columns}
@@ -694,6 +899,7 @@ def visualize_predictions(
             frame_out = frame_out.cpu().numpy()
             mask_np = mask.cpu().numpy() if mask is not None else None
             y_true = y_data.cpu().numpy()
+            tag_preds = apply_tagging_thresholds(clip_out, thresholds, tagging_system)
             for i in range(len(paths)):
                 file_stem = anuraset_file_stem(paths[i])
                 events = strong_events.get(file_stem, [])
@@ -718,7 +924,7 @@ def visualize_predictions(
                         selections[class_name]["wrong"]
                     ) >= max_per_class:
                         continue
-                    pred = clip_out[i, class_idx] >= thresholds["tag_threshold"]
+                    pred = tag_preds[i, class_idx] >= 0.5
                     target = y_true[i, class_idx] >= 0.5
                     bucket = "correct" if pred == target else "wrong"
                     if len(selections[class_name][bucket]) >= max_per_class:
@@ -771,6 +977,10 @@ def visualize_predictions(
                     return out, layout
 
                 fig, axes = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
+                fig.suptitle(
+                    f"Tagging={tagging_system} | Localization={localization_system}",
+                    fontsize=12,
+                )
                 gt_data = frame_true[:, active_classes].T
                 gt_plot, y_labels = build_spacer_rows(gt_data, active_names)
                 im0 = axes[0].imshow(
@@ -788,8 +998,23 @@ def visualize_predictions(
 
                 for idx in active_classes:
                     axes[1].plot(t_sec, frame_pred[:, idx], label=class_columns[idx])
-                axes[1].axhline(thresholds["loc_threshold_high"], color="red", linestyle="--", linewidth=1)
-                axes[1].axhline(thresholds["loc_threshold_low"], color="orange", linestyle="--", linewidth=1)
+                class_idx = sample["class_idx"]
+                if localization_system == "single":
+                    loc_value = float(thresholds["loc_threshold"][class_idx])
+                    axes[1].axhline(loc_value, color="red", linestyle="--", linewidth=1)
+                else:
+                    axes[1].axhline(
+                        float(thresholds["loc_threshold_high"][class_idx]),
+                        color="red",
+                        linestyle="--",
+                        linewidth=1,
+                    )
+                    axes[1].axhline(
+                        float(thresholds["loc_threshold_low"][class_idx]),
+                        color="orange",
+                        linestyle="--",
+                        linewidth=1,
+                    )
                 axes[1].set_ylim(0, 1)
                 axes[1].set_title("Frame-wise probabilities (line plot)")
                 axes[1].legend(loc="upper right")
@@ -809,7 +1034,9 @@ def visualize_predictions(
                 axes[2].set_yticklabels(y_labels)
                 axes[2].set_title("Frame-wise probabilities (heatmap)")
 
-                binary = binarize_with_activity_detection(frame_pred, class_columns, thresholds)
+                binary = binarize_with_activity_detection(
+                    frame_pred, class_columns, thresholds, localization_system
+                )
                 binary_data = binary[:, active_classes].T
                 binary_plot, _ = build_spacer_rows(binary_data, active_names)
                 im3 = axes[3].imshow(
@@ -823,7 +1050,10 @@ def visualize_predictions(
                 )
                 axes[3].set_yticks(np.arange(binary_plot.shape[0]) + 0.5)
                 axes[3].set_yticklabels(y_labels)
-                axes[3].set_title("Frame-wise detections (after activity_detection)")
+                axes[3].set_title(
+                    "Frame-wise detections (after activity_detection)" if localization_system == "double"
+                    else "Frame-wise detections (single threshold)"
+                )
                 axes[3].set_xlabel("Time (s)")
 
                 fig.colorbar(im3, ax=[axes[0], axes[2], axes[3]], location="right", fraction=0.02, pad=0.02)
@@ -865,6 +1095,50 @@ def evaluate_model(
     if return_arrays:
         return float(np.mean(losses)), metrics, y_true, y_pred
     return float(np.mean(losses)), metrics, None, None
+
+
+def evaluate_tagging_cached(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    thresholds: Dict[str, np.ndarray],
+    system: str,
+) -> Tuple[float, np.ndarray]:
+    y_hat = apply_tagging_thresholds(y_pred, thresholds, system)
+    class_f1 = compute_class_f1_binary(y_true, y_hat)
+    return float(np.mean(class_f1)) if class_f1.size else 0.0, class_f1
+
+
+def evaluate_localization_cached(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    class_columns: List[str],
+    thresholds: Dict[str, np.ndarray],
+    system: str,
+) -> Tuple[float, np.ndarray]:
+    y_hat = apply_localization_thresholds(y_pred, class_columns, thresholds, system)
+    class_f1 = compute_class_f1_binary(y_true, y_hat)
+    return float(np.mean(class_f1)) if class_f1.size else 0.0, class_f1
+
+
+def print_threshold_table(
+    title: str,
+    thresholds: Dict[str, np.ndarray],
+    class_columns: List[str],
+    system: str,
+    objective: str,
+) -> None:
+    print(title)
+    if system == "single":
+        key = "tag_threshold" if objective == "tagging" else "loc_threshold"
+        for class_name, value in zip(class_columns, thresholds[key]):
+            print(f"  {class_name}: {float(value):.3f}")
+    else:
+        low_key = "tag_threshold_low" if objective == "tagging" else "loc_threshold_low"
+        high_key = "tag_threshold_high" if objective == "tagging" else "loc_threshold_high"
+        for class_name, low_value, high_value in zip(
+            class_columns, thresholds[low_key], thresholds[high_key]
+        ):
+            print(f"  {class_name}: low={float(low_value):.3f}, high={float(high_value):.3f}")
 
 
 def plot_training_history(history: Dict[str, List[float]], output_path: str) -> None:
@@ -969,6 +1243,7 @@ if __name__ == "__main__":
 
     TARGET_SPECIES = config.TARGET_SPECIES
     INCLUDE_NEGATIVE_SPLITS = config.INCLUDE_NEGATIVE_SPLITS
+    USE_CLASS_SPECIFIC_THRESHOLD_TUNING = config.USE_CLASS_SPECIFIC_THRESHOLD_TUNING
     STRONG_LABELS_458 = config.STRONG_LABELS_458
     STRONG_LABELS_578 = config.STRONG_LABELS_578
     STRONG_LABEL_LEVELS = config.STRONG_LABEL_LEVELS
@@ -1294,6 +1569,7 @@ if __name__ == "__main__":
     print(">>> [config] APPLY_TEST_SPLIT=", APPLY_TEST_SPLIT)
     print(">>> [config] TARGET_SPECIES=", TARGET_SPECIES)
     print(">>> [config] INCLUDE_NEGATIVE_SPLITS=", INCLUDE_NEGATIVE_SPLITS)
+    print(">>> [config] USE_CLASS_SPECIFIC_THRESHOLD_TUNING=", USE_CLASS_SPECIFIC_THRESHOLD_TUNING)
     print(">>> [config] STRONG_LABEL_LEVELS=", STRONG_LABEL_LEVELS)
     print(">>> [config] ANURASET_EVAL=", ANURASET_EVAL)
     print(">>> [config] LOCALIZATION_MODE=", LOCALIZATION_MODE)
@@ -1396,93 +1672,290 @@ if __name__ == "__main__":
 
     best_macro_model = build_model(MODEL_NAME, num_classes, pool_style, model_seq_len, n_mels).to(device)
     best_macro_model.load_state_dict(torch.load(best_macro_path, map_location=device))
-    macro_test_loss, macro_test_metrics, macro_y_true, macro_y_pred = evaluate_model(
-        best_macro_model, test_loader, loss_fn, device, threshold, return_arrays=True
-    )
-    macro_class_f1 = compute_class_f1(macro_y_true, macro_y_pred, threshold)
 
     best_micro_model = build_model(MODEL_NAME, num_classes, pool_style, model_seq_len, n_mels).to(device)
     best_micro_model.load_state_dict(torch.load(best_micro_path, map_location=device))
-    micro_test_loss, micro_test_metrics, micro_y_true, micro_y_pred = evaluate_model(
-        best_micro_model, test_loader, loss_fn, device, threshold, return_arrays=True
-    )
-    micro_class_f1 = compute_class_f1(micro_y_true, micro_y_pred, threshold)
 
-    print("Best Macro Model Test Results")
-    print(f"Loss: {macro_test_loss:.4f}")
-    print(macro_test_metrics)
-    print("Macro Model Class F1:")
-    for class_name, f1_value in zip(class_columns, macro_class_f1):
-        print(f"  {class_name}: {f1_value:.4f}")
+    frame_duration = hop_length / sample_rate
 
-    print("Best Micro Model Test Results")
-    print(f"Loss: {micro_test_loss:.4f}")
-    print(micro_test_metrics)
-    print("Micro Model Class F1:")
-    for class_name, f1_value in zip(class_columns, micro_class_f1):
-        print(f"  {class_name}: {f1_value:.4f}")
+    if USE_CLASS_SPECIFIC_THRESHOLD_TUNING:
+        tuning_step = 0.05
+        max_rounds = 50
+        base_thresholds = {
+            "tag_threshold": np.full(num_classes, threshold, dtype=np.float32),
+            "tag_threshold_low": np.full(num_classes, threshold, dtype=np.float32),
+            "tag_threshold_high": np.full(num_classes, threshold, dtype=np.float32),
+            "loc_threshold": np.full(num_classes, ANURASET_EVAL["loc_threshold_high"], dtype=np.float32),
+            "loc_threshold_low": np.full(num_classes, ANURASET_EVAL["loc_threshold_low"], dtype=np.float32),
+            "loc_threshold_high": np.full(num_classes, ANURASET_EVAL["loc_threshold_high"], dtype=np.float32),
+            "smooth": ANURASET_EVAL["smooth"],
+        }
 
-    if strong_events is not None and DATASET_TEST == "AnuraSet":
-        frame_duration = hop_length / sample_rate
-        loc_metrics_macro, loc_class_f1_macro = evaluate_localization(
-            best_macro_model,
-            test_loader,
-            strong_events,
-            class_columns,
-            threshold,
-            device,
-            LOCALIZATION_MODE,
-            BLOCK_SECONDS,
-            frame_duration,
-            pool_style,
+        def run_tuning_for_model(model: nn.Module, name: str) -> None:
+            val_cache = cache_model_outputs(
+                model,
+                val_loader,
+                device,
+                strong_events if DATASET_VAL == "AnuraSet" else None,
+                class_columns,
+                LOCALIZATION_MODE,
+                BLOCK_SECONDS,
+                frame_duration,
+                pool_style,
+            )
+            test_cache = cache_model_outputs(
+                model,
+                test_loader,
+                device,
+                strong_events if DATASET_TEST == "AnuraSet" else None,
+                class_columns,
+                LOCALIZATION_MODE,
+                BLOCK_SECONDS,
+                frame_duration,
+                pool_style,
+            )
+
+            print(f"{name} Tagging Threshold Tuning (single)")
+            tag_single, tag_single_score = iterative_threshold_optimization(
+                val_cache["clip_true"],
+                val_cache["clip_out"],
+                {"tag_threshold": base_thresholds["tag_threshold"]},
+                system="single",
+                step=tuning_step,
+                max_rounds=max_rounds,
+                objective="tagging",
+            )
+            print_threshold_table(
+                f"{name} Tagging Thresholds (single)",
+                tag_single,
+                class_columns,
+                system="single",
+                objective="tagging",
+            )
+
+            print(f"{name} Tagging Threshold Tuning (double)")
+            tag_double, tag_double_score = iterative_threshold_optimization(
+                val_cache["clip_true"],
+                val_cache["clip_out"],
+                {
+                    "tag_threshold_low": base_thresholds["tag_threshold_low"],
+                    "tag_threshold_high": base_thresholds["tag_threshold_high"],
+                },
+                system="double",
+                step=tuning_step,
+                max_rounds=max_rounds,
+                objective="tagging",
+            )
+            print_threshold_table(
+                f"{name} Tagging Thresholds (double)",
+                tag_double,
+                class_columns,
+                system="double",
+                objective="tagging",
+            )
+
+            tag_single_f1, _ = evaluate_tagging_cached(
+                test_cache["clip_true"], test_cache["clip_out"], tag_single, system="single"
+            )
+            tag_double_f1, _ = evaluate_tagging_cached(
+                test_cache["clip_true"], test_cache["clip_out"], tag_double, system="double"
+            )
+            print(f"{name} Tagging - single threshold macro F1: {tag_single_f1:.4f}")
+            print(f"{name} Tagging - double threshold macro F1: {tag_double_f1:.4f}")
+
+            loc_single_f1 = 0.0
+            loc_double_f1 = 0.0
+            loc_single = {}
+            loc_double = {}
+            loc_single_score = 0.0
+            loc_double_score = 0.0
+            if val_cache["frame_true"].size and test_cache["frame_true"].size:
+                print(f"{name} Localization Threshold Tuning (single)")
+                loc_single, loc_single_score = iterative_threshold_optimization(
+                    val_cache["frame_true"],
+                    val_cache["frame_out"],
+                    {"loc_threshold": base_thresholds["loc_threshold"]},
+                    system="single",
+                    step=tuning_step,
+                    max_rounds=max_rounds,
+                    objective="localization",
+                    class_columns=class_columns,
+                )
+                print_threshold_table(
+                    f"{name} Localization Thresholds (single)",
+                    loc_single,
+                    class_columns,
+                    system="single",
+                    objective="localization",
+                )
+
+                print(f"{name} Localization Threshold Tuning (double)")
+                loc_double, loc_double_score = iterative_threshold_optimization(
+                    val_cache["frame_true"],
+                    val_cache["frame_out"],
+                    {
+                        "loc_threshold_low": base_thresholds["loc_threshold_low"],
+                        "loc_threshold_high": base_thresholds["loc_threshold_high"],
+                        "smooth": base_thresholds["smooth"],
+                    },
+                    system="double",
+                    step=tuning_step,
+                    max_rounds=max_rounds,
+                    objective="localization",
+                    class_columns=class_columns,
+                )
+                print_threshold_table(
+                    f"{name} Localization Thresholds (double)",
+                    loc_double,
+                    class_columns,
+                    system="double",
+                    objective="localization",
+                )
+
+                loc_single_f1, _ = evaluate_localization_cached(
+                    test_cache["frame_true"],
+                    test_cache["frame_out"],
+                    class_columns,
+                    loc_single,
+                    system="single",
+                )
+                loc_double_f1, _ = evaluate_localization_cached(
+                    test_cache["frame_true"],
+                    test_cache["frame_out"],
+                    class_columns,
+                    loc_double,
+                    system="double",
+                )
+                print(f"{name} Localization - single threshold macro F1: {loc_single_f1:.4f}")
+                print(f"{name} Localization - double threshold macro F1: {loc_double_f1:.4f}")
+
+            tag_system = "single" if tag_single_score >= tag_double_score else "double"
+            loc_system = "single" if loc_single_score >= loc_double_score else "double"
+            combined_thresholds = {
+                "tag_threshold": tag_single.get("tag_threshold", base_thresholds["tag_threshold"]),
+                "tag_threshold_low": tag_double.get("tag_threshold_low", base_thresholds["tag_threshold_low"]),
+                "tag_threshold_high": tag_double.get("tag_threshold_high", base_thresholds["tag_threshold_high"]),
+                "loc_threshold": loc_single.get("loc_threshold", base_thresholds["loc_threshold"]),
+                "loc_threshold_low": loc_double.get("loc_threshold_low", base_thresholds["loc_threshold_low"]),
+                "loc_threshold_high": loc_double.get("loc_threshold_high", base_thresholds["loc_threshold_high"]),
+                "smooth": base_thresholds["smooth"],
+            }
+
+            if strong_events is not None and DATASET_TEST == "AnuraSet":
+                visualize_predictions(
+                    model,
+                    test_loader,
+                    strong_events,
+                    class_columns,
+                    combined_thresholds,
+                    output_root="results/AnuraSet/viz",
+                    prefix=f"{name.lower()}_{tag_system}_{loc_system}",
+                    localization_mode=LOCALIZATION_MODE,
+                    block_seconds=BLOCK_SECONDS,
+                    frame_duration=frame_duration,
+                    pool_style=pool_style,
+                    tagging_system=tag_system,
+                    localization_system=loc_system,
+                )
+
+        run_tuning_for_model(best_macro_model, "Best Macro Model")
+        run_tuning_for_model(best_micro_model, "Best Micro Model")
+    else:
+        macro_test_loss, macro_test_metrics, macro_y_true, macro_y_pred = evaluate_model(
+            best_macro_model, test_loader, loss_fn, device, threshold, return_arrays=True
         )
-        print("Macro Model Localization Metrics")
-        print(loc_metrics_macro)
-        print("Macro Model Localization Class F1:")
-        for class_name, f1_value in zip(class_columns, loc_class_f1_macro):
+        macro_class_f1 = compute_class_f1(macro_y_true, macro_y_pred, threshold)
+
+        micro_test_loss, micro_test_metrics, micro_y_true, micro_y_pred = evaluate_model(
+            best_micro_model, test_loader, loss_fn, device, threshold, return_arrays=True
+        )
+        micro_class_f1 = compute_class_f1(micro_y_true, micro_y_pred, threshold)
+
+        print("Best Macro Model Test Results")
+        print(f"Loss: {macro_test_loss:.4f}")
+        print(macro_test_metrics)
+        print("Macro Model Class F1:")
+        for class_name, f1_value in zip(class_columns, macro_class_f1):
             print(f"  {class_name}: {f1_value:.4f}")
 
-        loc_metrics_micro, loc_class_f1_micro = evaluate_localization(
-            best_micro_model,
-            test_loader,
-            strong_events,
-            class_columns,
-            threshold,
-            device,
-            LOCALIZATION_MODE,
-            BLOCK_SECONDS,
-            frame_duration,
-            pool_style,
-        )
-        print("Micro Model Localization Metrics")
-        print(loc_metrics_micro)
-        print("Micro Model Localization Class F1:")
-        for class_name, f1_value in zip(class_columns, loc_class_f1_micro):
+        print("Best Micro Model Test Results")
+        print(f"Loss: {micro_test_loss:.4f}")
+        print(micro_test_metrics)
+        print("Micro Model Class F1:")
+        for class_name, f1_value in zip(class_columns, micro_class_f1):
             print(f"  {class_name}: {f1_value:.4f}")
 
-        visualize_predictions(
-            best_macro_model,
-            test_loader,
-            strong_events,
-            class_columns,
-            ANURASET_EVAL,
-            output_root="results/AnuraSet/viz",
-            prefix="macro",
-            localization_mode=LOCALIZATION_MODE,
-            block_seconds=BLOCK_SECONDS,
-            frame_duration=frame_duration,
-            pool_style=pool_style,
-        )
-        visualize_predictions(
-            best_micro_model,
-            test_loader,
-            strong_events,
-            class_columns,
-            ANURASET_EVAL,
-            output_root="results/AnuraSet/viz",
-            prefix="micro",
-            localization_mode=LOCALIZATION_MODE,
-            block_seconds=BLOCK_SECONDS,
-            frame_duration=frame_duration,
-            pool_style=pool_style,
-        )
+        if strong_events is not None and DATASET_TEST == "AnuraSet":
+            loc_metrics_macro, loc_class_f1_macro = evaluate_localization(
+                best_macro_model,
+                test_loader,
+                strong_events,
+                class_columns,
+                threshold,
+                device,
+                LOCALIZATION_MODE,
+                BLOCK_SECONDS,
+                frame_duration,
+                pool_style,
+            )
+            print("Macro Model Localization Metrics")
+            print(loc_metrics_macro)
+            print("Macro Model Localization Class F1:")
+            for class_name, f1_value in zip(class_columns, loc_class_f1_macro):
+                print(f"  {class_name}: {f1_value:.4f}")
+
+            loc_metrics_micro, loc_class_f1_micro = evaluate_localization(
+                best_micro_model,
+                test_loader,
+                strong_events,
+                class_columns,
+                threshold,
+                device,
+                LOCALIZATION_MODE,
+                BLOCK_SECONDS,
+                frame_duration,
+                pool_style,
+            )
+            print("Micro Model Localization Metrics")
+            print(loc_metrics_micro)
+            print("Micro Model Localization Class F1:")
+            for class_name, f1_value in zip(class_columns, loc_class_f1_micro):
+                print(f"  {class_name}: {f1_value:.4f}")
+
+            thresholds = {
+                "tag_threshold": np.full(num_classes, threshold, dtype=np.float32),
+                "loc_threshold": np.full(num_classes, ANURASET_EVAL["loc_threshold_high"], dtype=np.float32),
+                "loc_threshold_low": np.full(num_classes, ANURASET_EVAL["loc_threshold_low"], dtype=np.float32),
+                "loc_threshold_high": np.full(num_classes, ANURASET_EVAL["loc_threshold_high"], dtype=np.float32),
+                "smooth": ANURASET_EVAL["smooth"],
+            }
+            visualize_predictions(
+                best_macro_model,
+                test_loader,
+                strong_events,
+                class_columns,
+                thresholds,
+                output_root="results/AnuraSet/viz",
+                prefix="macro_fixed",
+                localization_mode=LOCALIZATION_MODE,
+                block_seconds=BLOCK_SECONDS,
+                frame_duration=frame_duration,
+                pool_style=pool_style,
+                tagging_system="single",
+                localization_system="single",
+            )
+            visualize_predictions(
+                best_micro_model,
+                test_loader,
+                strong_events,
+                class_columns,
+                thresholds,
+                output_root="results/AnuraSet/viz",
+                prefix="micro_fixed",
+                localization_mode=LOCALIZATION_MODE,
+                block_seconds=BLOCK_SECONDS,
+                frame_duration=frame_duration,
+                pool_style=pool_style,
+                tagging_system="single",
+                localization_system="single",
+            )
